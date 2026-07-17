@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome MCP",
+  "version": "0.1.0",
+  "description": "Connect Chrome tabs to a local MCP server.",
+  "permissions": ["activeTab", "alarms", "debugger", "scripting", "tabs", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "Chrome MCP"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
