@@ -32,6 +32,12 @@ The WebSocket bridge binds to `127.0.0.1:18765` and the HTTP API binds to `127.0
 
 Use `CHROME_API_PORT` to change the HTTP API port. `CHROME_MCP_PORT` changes the extension WebSocket bridge port, but requires updating `SERVER_URL` in `extension/src/background.js` as well.
 
+For an Alfred Docker worker running through WSL, keep the primary bridge on
+loopback and configure `CHROME_AGENT_API_HOST` plus
+`CHROME_AGENT_API_PORT` for a second HTTP listener on the specific Windows/WSL
+gateway address. Configure the worker with that endpoint. Do not use
+`0.0.0.0`: CDP control can read and operate the connected browser.
+
 ## HTTP API and OpenAPI
 
 Fetch the complete API contract from:

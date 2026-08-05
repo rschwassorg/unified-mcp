@@ -9,6 +9,9 @@ import { WebSocket, WebSocketServer } from "ws";
 const require = createRequire(import.meta.url);
 const BRIDGE_PORT = Number(process.env.CHROME_MCP_PORT ?? 18765);
 const API_PORT = Number(process.env.CHROME_API_PORT ?? 18766);
+const BIND_HOST = process.env.CHROME_BIND_HOST ?? "127.0.0.1";
+const AGENT_API_HOST = process.env.CHROME_AGENT_API_HOST || "";
+const AGENT_API_PORT = Number(process.env.CHROME_AGENT_API_PORT ?? 0);
 const REQUEST_TIMEOUT_MS = Number(process.env.CHROME_MCP_TIMEOUT_MS ?? 15000);
 const DEBUG_LOG = process.env.CHROME_MCP_DEBUG_LOG || join(process.cwd(), "chrome-mcp-debug.log");
 
@@ -27,7 +30,7 @@ const pending = new Map<string, { resolve: (value: unknown) => void; reject: (re
 let extensionSocket: WebSocket | null = null;
 let shuttingDown = false;
 
-const wss = new WebSocketServer({ host: "127.0.0.1", port: BRIDGE_PORT });
+const wss = new WebSocketServer({ host: BIND_HOST, port: BRIDGE_PORT });
 wss.on("error", (error) => {
   debug("websocket-error", { message: error.message });
   console.error(`Chrome bridge WebSocket failed: ${error.message}`);
@@ -59,13 +62,26 @@ wss.on("connection", (socket) => {
   });
 });
 
-const api = createServer((request, response) => { void handleHttp(request, response); });
-api.listen(API_PORT, "127.0.0.1", () => debug("api-start", { apiPort: API_PORT, bridgePort: BRIDGE_PORT, pid: process.pid }));
+const apiHandler = (request: IncomingMessage, response: ServerResponse) => { void handleHttp(request, response); };
+const api = createServer(apiHandler);
+api.listen(API_PORT, BIND_HOST, () => debug("api-start", { apiPort: API_PORT, bridgePort: BRIDGE_PORT, bindHost: BIND_HOST, pid: process.pid }));
 api.on("error", (error) => {
   debug("api-error", { message: error.message });
   console.error(`Chrome API failed: ${error.message}`);
   process.exitCode = 1;
 });
+if (AGENT_API_HOST || AGENT_API_PORT) {
+  if (!AGENT_API_HOST || !Number.isInteger(AGENT_API_PORT) || AGENT_API_PORT < 1 || AGENT_API_PORT > 65535) {
+    throw new Error("CHROME_AGENT_API_HOST and a valid CHROME_AGENT_API_PORT must be configured together");
+  }
+  const agentApi = createServer(apiHandler);
+  agentApi.listen(AGENT_API_PORT, AGENT_API_HOST, () => debug("agent-api-start", { agentApiPort: AGENT_API_PORT, agentApiHost: AGENT_API_HOST, pid: process.pid }));
+  agentApi.on("error", (error) => {
+    debug("agent-api-error", { message: error.message });
+    console.error(`Chrome agent API failed: ${error.message}`);
+    process.exitCode = 1;
+  });
+}
 
 // MCP remains available over stdio for existing clients. HTTP is an additional interface.
 const mcpTools = [
