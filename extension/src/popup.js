@@ -5,7 +5,7 @@ const reconnect = document.querySelector("#reconnect");
 async function refresh() {
   const {
     connected = false,
-    serverUrl = "ws://127.0.0.1:18765",
+    serverUrl = "ws://127.0.0.1:18767",
     lastError = null,
     updatedAt = null
   } = await chrome.storage.local.get(["connected", "serverUrl", "lastError", "updatedAt"]);

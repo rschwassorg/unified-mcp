@@ -7,3 +7,6 @@ codex-prompt-input.json
 .env
 .env.*
 !.env.example
+*.crt
+*.key
+*.pem

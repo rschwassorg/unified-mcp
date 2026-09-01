@@ -1,4 +1,5 @@
-const SERVER_URL = "ws://127.0.0.1:18765";
+const DEFAULT_SERVER_URL = "ws://127.0.0.1:18767";
+const LEGACY_SERVER_URL = "wss://localhost:9443/bridge";
 const RECONNECT_ALARM = "chrome-mcp-reconnect";
 const HEARTBEAT_MS = 20000;
 const RECONNECT_MS = 15000;
@@ -8,18 +9,39 @@ const MAX_CDP_EVENTS = 500;
 let socket = null;
 let reconnectTimer = null;
 let heartbeatTimer = null;
+let connecting = false;
 let connected = false;
 let lastError = null;
 let cdpEventSequence = 0;
 const cdpEvents = [];
 const attachedDebuggees = new Map();
+let connectionSettings = null;
+
+async function getConnectionSettings() {
+  const stored = await chrome.storage.local.get(["serverUrl", "browserId", "browserName", "psk"]);
+  const serverUrl = !stored.serverUrl || stored.serverUrl === LEGACY_SERVER_URL
+    ? DEFAULT_SERVER_URL
+    : stored.serverUrl;
+  if (stored.serverUrl !== serverUrl) await chrome.storage.local.set({ serverUrl });
+  let browserId = stored.browserId;
+  if (!browserId) {
+    browserId = crypto.randomUUID();
+    await chrome.storage.local.set({ browserId });
+  }
+  return {
+    serverUrl,
+    browserId,
+    browserName: stored.browserName || `Chrome ${browserId.slice(0, 8)}`,
+    psk: stored.psk || ""
+  };
+}
 
 async function setStatus(nextConnected, error = null) {
   connected = nextConnected;
   lastError = error;
   await chrome.storage.local.set({
     connected,
-    serverUrl: SERVER_URL,
+    serverUrl: connectionSettings?.serverUrl || DEFAULT_SERVER_URL,
     lastError,
     updatedAt: new Date().toISOString()
   });
@@ -35,37 +57,45 @@ function scheduleReconnect() {
   }, RECONNECT_MS);
 }
 
-function connect() {
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+async function connect() {
+  if (connecting || (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING))) {
     return;
   }
 
+  connecting = true;
+  let nextSocket;
   try {
-    socket = new WebSocket(SERVER_URL);
+    connectionSettings = await getConnectionSettings();
+    nextSocket = new WebSocket(connectionSettings.serverUrl);
+    socket = nextSocket;
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error);
     scheduleReconnect();
     return;
+  } finally {
+    connecting = false;
   }
 
-  socket.addEventListener("open", () => {
+  nextSocket.addEventListener("open", () => {
     lastError = null;
-    send({ type: "hello", role: "extension" });
+    send({ type: "hello", role: "extension", browserId: connectionSettings.browserId, browserName: connectionSettings.browserName, psk: connectionSettings.psk });
     void setStatus(true);
     startHeartbeat();
   });
 
-  socket.addEventListener("close", () => {
+  nextSocket.addEventListener("close", () => {
+    if (socket !== nextSocket) return;
     socket = null;
     scheduleReconnect();
   });
 
-  socket.addEventListener("error", () => {
-    lastError = `Could not connect to ${SERVER_URL}`;
+  nextSocket.addEventListener("error", () => {
+    if (socket !== nextSocket) return;
+    lastError = `Could not connect to ${connectionSettings?.serverUrl || DEFAULT_SERVER_URL}`;
     scheduleReconnect();
   });
 
-  socket.addEventListener("message", async (event) => {
+  nextSocket.addEventListener("message", async (event) => {
     let message;
     try {
       message = JSON.parse(event.data);
@@ -396,14 +426,15 @@ function recordCdpEvent(debuggee, method, params) {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.action === "status") {
-    sendResponse({ connected, serverUrl: SERVER_URL, lastError });
+    sendResponse({ connected, serverUrl: connectionSettings?.serverUrl || DEFAULT_SERVER_URL, lastError });
     return false;
   }
 
   if (message?.action === "reconnect") {
     if (socket) {
-      socket.close();
+      const previousSocket = socket;
       socket = null;
+      previousSocket.close();
     }
     connect();
     sendResponse({ ok: true });

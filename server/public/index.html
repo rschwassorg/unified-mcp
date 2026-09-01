@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Chrome CDP Bridge</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="backdrop"></div>
+  <main>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">Unified MCP / Chrome CDP</p>
+        <h1>Browser fleet</h1>
+        <p class="lede">Live clients connected to the local CDP bridge.</p>
+      </div>
+      <div class="live-pill"><span class="pulse"></span><span id="serverState">Connecting</span></div>
+    </header>
+
+    <section class="metrics" aria-label="Bridge metrics">
+      <article><span>Connected clients</span><strong id="clientCount">—</strong></article>
+      <article><span>Pending requests</span><strong id="pendingCount">—</strong></article>
+      <article><span>API port</span><strong id="apiPort">—</strong></article>
+      <article><span>Bridge port</span><strong id="bridgePort">—</strong></article>
+    </section>
+
+    <section class="fleet">
+      <div class="section-heading">
+        <div><p class="eyebrow">Clients</p><h2>Connected browsers</h2></div>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+      <div id="clients" class="client-grid" aria-live="polite"></div>
+      <div id="empty" class="empty" hidden>
+        <div class="empty-icon">⌁</div>
+        <h3>No browsers connected</h3>
+        <p>Load the extension, configure its WSS endpoint and PSK, then reconnect.</p>
+      </div>
+    </section>
+
+    <footer><span id="lastUpdated">Waiting for first update</span><span>Auto-refreshes every 3 seconds</span></footer>
+  </main>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

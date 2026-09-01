@@ -1,87 +1,119 @@
-# Chrome CDP Bridge
+# Unified MCP with multi-client Chrome CDP
 
-A local Chrome extension plus Node server that exposes Chrome tabs and Chrome DevTools Protocol (CDP) through two interfaces:
-
-- **HTTP API** with an OpenAPI 3.1 document, for API-aware clients.
-- **MCP stdio server**, retained for existing MCP clients.
-
-Both interfaces use the same Chrome extension and `chrome.debugger` connection, so only one debugger attachment is used per target.
-
-## Architecture
+This repository runs an extensible local MCP server behind an nginx HTTPS endpoint. Chrome CDP is its first tool family. Any number of Chrome profiles or remote browser machines can check in over authenticated WSS, and every Chrome tool accepts a `browserId` to route work to a specific browser.
 
 ```text
-HTTP client or MCP client -> Node bridge -> local WebSocket -> Chrome extension -> chrome.debugger -> CDP
+MCP clients  -- HTTPS /mcp ---+--> nginx :9443 --> Node backend (loopback only)
+REST clients -- HTTPS /v1 ----+                         +--> VibeTerm MCP :47821
+Chrome A ----- WSS /bridge ---+                         +--> browser registry
+Chrome B ----- WSS /bridge ---+                         +--> Chrome CDP tools
 ```
 
-The WebSocket bridge binds to `127.0.0.1:18765` and the HTTP API binds to `127.0.0.1:18766` by default. Neither is exposed to the network.
+nginx terminates TLS but does not execute MCP logic. On Windows, nginx and the Node backend therefore run as two automatic services. Both backend ports remain on `127.0.0.1`.
 
-## Start
+## Security model
 
-1. Build and start the bridge:
+- TLS is required on the exposed listener.
+- Browsers authenticate in their first WSS message with a pre-shared key.
+- MCP and REST clients use `Authorization: Bearer <PSK>`.
+- The Windows installer generates a 256-bit PSK under `%ProgramData%\UnifiedMcp\secrets`, accessible only to SYSTEM and Administrators.
+- The PSK is never written into nginx configuration, service XML, logs, or source control.
+- The included certificate is self-signed. Import its public `.crt` into Trusted Root Certification Authorities on every client machine. Replace it with a trusted certificate before wider use.
 
-   ```powershell
-   cd server
-   npm install
-   npm run build
-   npm start
-   ```
+Anyone holding the PSK can fully control connected browsers. Use a firewall allowlist, rotate the PSK if exposed, and do not expose port 9443 directly to the public internet.
 
-2. In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `extension/`.
+### Temporary local no-auth mode
 
-3. Open the extension popup and confirm it reports connected.
+For a loopback-only development installation, set
+`UNIFIED_MCP_ALLOW_NO_AUTH=true`. This explicitly bypasses PSK checks for the
+WSS bridge, MCP, and REST endpoints. The Windows installer accepts
+`-AllowNoAuth` to set this service environment variable. Do not use this mode
+on a listener reachable from another machine.
 
-Use `CHROME_API_PORT` to change the HTTP API port. `CHROME_MCP_PORT` changes the extension WebSocket bridge port, but requires updating `SERVER_URL` in `extension/src/background.js` as well.
+Without administrator access, run `deploy/windows/start-no-auth.ps1`. It binds
+the browser bridge to `ws://127.0.0.1:18767` and the MCP/REST API to
+`http://127.0.0.1:18768`. Reload the unpacked extension once so it migrates
+from the legacy WSS service URL to this loopback-only endpoint.
 
-For an Alfred Docker worker running through WSL, keep the primary bridge on
-loopback and configure `CHROME_AGENT_API_HOST` plus
-`CHROME_AGENT_API_PORT` for a second HTTP listener on the specific Windows/WSL
-gateway address. Configure the worker with that endpoint. Do not use
-`0.0.0.0`: CDP control can read and operate the connected browser.
+For an authenticated user-scoped launch without installing Windows services,
+run `deploy/windows/start-authenticated.ps1`. It creates a 256-bit PSK under
+`%LOCALAPPDATA%\UnifiedMcp\secrets`, restricts that directory to the current
+Windows identity, and starts the same loopback endpoints with bearer
+authentication enabled. `ensure-user-psk.ps1 -CopyToClipboard` copies the PSK
+without printing it so it can be entered into the extension or a trusted
+reverse proxy. Direct local MCP calls whose connection and HTTP Host are both
+loopback may omit the PSK; requests forwarded for a public hostname still
+require it.
 
-## HTTP API and OpenAPI
+To start the authenticated server and its named Cloudflare Tunnel whenever the
+current user signs in, run `deploy/windows/install-user-autostart.ps1`. The
+scheduled tasks run with limited current-user privileges and restart failed
+processes without embedding the PSK in task definitions or command lines.
 
-Fetch the complete API contract from:
+## Windows service install
 
-```text
-GET http://127.0.0.1:18766/openapi.json
-```
-
-Check availability with `GET /health`. When the extension is not connected, Chrome operations return `503` with an explanation.
-
-Examples:
+Prerequisites are Node.js/npm, nginx for Windows, a [WinSW](https://github.com/winsw/winsw/releases) executable, OpenSSL 1.1.1+, and an elevated PowerShell prompt.
 
 ```powershell
-# List Chrome tabs
-Invoke-RestMethod http://127.0.0.1:18766/v1/tabs
-
-# Read the current page title through CDP
-Invoke-RestMethod -Method Post http://127.0.0.1:18766/v1/cdp/commands `
-  -ContentType 'application/json' `
-  -Body '{"tabId":123,"command":"Runtime.evaluate","params":{"expression":"document.title","returnByValue":true}}'
+cd C:\path\to\chrome-cdp-bridge
+.\deploy\windows\install.ps1 `
+  -NginxRoot C:\tools\nginx `
+  -WinSWExe C:\tools\WinSW-x64.exe `
+  -PublicHost localhost
 ```
 
-The main paths are:
+The installer builds the backend, creates the PSK and certificate if absent, validates nginx, and installs `UnifiedMcpBackend` followed by `UnifiedMcpNginx`. It does not print the PSK. To remove only the services while retaining configuration, certificates, secrets, and logs:
 
-- `/v1/tabs` and `/v1/pages/{tabId}/…` for common browser operations.
-- `/v1/cdp/targets`, `/v1/cdp/attach`, `/v1/cdp/events`, and `/v1/cdp/detach` for CDP lifecycle operations.
-- `POST /v1/cdp/commands` for any CDP command. It accepts `command`, `params`, and a `tabId`, `targetId`, or `extensionId`.
-- `GET /v1/cdp/protocol` for the bundled official DevTools Protocol metadata.
+```powershell
+.\deploy\windows\uninstall.ps1
+```
 
-The API does not enable CORS and binds only to loopback. CDP commands and page-script execution are powerful: do not rebind this service to a public interface without adding authentication and access controls.
+## Configure each Chrome client
 
-## MCP client configuration
+1. Open `chrome://extensions`, enable Developer mode, and load `extension/` unpacked.
+2. Open the extension details and choose **Extension options**.
+3. Set a unique stable Browser ID and useful name.
+4. Set the endpoint, such as `wss://localhost:9443/bridge`.
+5. Copy the PSK from the server as an Administrator, enter it in the options, and save.
 
-Existing MCP clients can continue to use:
+For remote browser machines use a DNS name or IP covered by the certificate. The popup reports connection state without displaying the PSK.
+
+## MCP configuration
+
+The Streamable HTTP endpoint is `https://localhost:9443/mcp`. Configure the MCP client to send the PSK as a Bearer token. The backend discovers and forwards VibeTerm's project and terminal tools from `http://127.0.0.1:47821/mcp`, so clients need only this one endpoint. `chrome_browsers_list` lists available IDs. When exactly one browser is connected, `browserId` may be omitted; with multiple browsers it is required.
+
+Run `deploy/windows/configure-codex-env.ps1` after installation. It shares the gateway PSK with VibeTerm, trusts the TLS certificate in Windows and WSL, and maps `unified-mcp.local` to WSL's current Windows-host gateway. VibeTerm refreshes that WSL route whenever it starts its Codex app server.
+
+```http
+POST /mcp HTTP/1.1
+Host: localhost:9443
+Authorization: Bearer <PSK>
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"chrome_tabs_list","arguments":{"browserId":"work-laptop"}}}
+```
+
+The existing stdio MCP interface remains available for local compatibility:
 
 ```json
 {
   "mcpServers": {
-    "chrome-mcp": {
+    "unified-local": {
       "command": "node",
-      "args": ["C:/Users/rober/tools/vibecoder/chrome-mcp/server/dist/index.js"]
+      "args": ["C:/path/to/chrome-cdp-bridge/server/dist/index.js"]
     }
   }
 }
 ```
 
-MCP tools and HTTP routes operate against the same live Chrome bridge.
+## REST and health
+
+Open `https://localhost:9443/` for a live dashboard of connected browser clients, heartbeat times, and bridge metrics.
+
+`GET /health` is intentionally unauthenticated and returns service/browser connection metadata. `/v1/*` and `/openapi.json` require the Bearer PSK. Select a browser using `X-Browser-Id`, `?browserId=...`, or `browserId` in a JSON body.
+
+The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables are `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
+
+## Add more unified tools
+
+Add local tool definitions to `localMcpTools` and dispatch them from `mcpCall` in `server/src/index.ts`. Additional Streamable HTTP tool families can use the upstream adapter in `server/src/mcp-upstream.ts`.
