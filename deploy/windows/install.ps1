@@ -18,8 +18,14 @@ $serviceRoot = Join-Path $env:ProgramData "UnifiedMcp"
 $secretRoot = Join-Path $serviceRoot "secrets"
 $certRoot = Join-Path $serviceRoot "certs"
 $logRoot = Join-Path $serviceRoot "logs"
+$filesystemConfigPath = Join-Path $serviceRoot "filesystem-roots.json"
 
 New-Item -ItemType Directory -Force -Path $serviceRoot,$secretRoot,$certRoot,$logRoot | Out-Null
+if (-not (Test-Path -LiteralPath $filesystemConfigPath)) {
+  $defaultCodeRoot = Join-Path $env:USERPROFILE "code"
+  $filesystemConfig = @{ roots = @{ code = @{ path = $defaultCodeRoot; readOnly = $false } } } | ConvertTo-Json -Depth 5
+  Set-Content -LiteralPath $filesystemConfigPath -Value $filesystemConfig -Encoding utf8
+}
 npm --prefix (Join-Path $projectRoot "server") ci
 npm --prefix (Join-Path $projectRoot "server") run build
 
@@ -49,11 +55,12 @@ Set-Content -LiteralPath $nginxConfigPath -Value $nginxConfig -Encoding ascii
 $escapedProject = [Security.SecurityElement]::Escape($projectRoot)
 $escapedNode = [Security.SecurityElement]::Escape($nodePath)
 $escapedPsk = [Security.SecurityElement]::Escape($pskPath)
+$escapedFilesystemConfig = [Security.SecurityElement]::Escape($filesystemConfigPath)
 $escapedNginx = [Security.SecurityElement]::Escape((Join-Path $nginxRootPath "nginx.exe"))
 $nginxPrefix = $nginxRootPath.Replace("\", "/") + "/"
 $noAuthEnvironment = if ($AllowNoAuth) { '<env name="UNIFIED_MCP_ALLOW_NO_AUTH" value="true"/>' } else { '' }
 $backendXml = @"
-<service><id>UnifiedMcpBackend</id><name>Unified MCP Backend</name><description>Unified MCP and multi-client Chrome CDP backend.</description><executable>$escapedNode</executable><arguments>&quot;$escapedProject\server\dist\index.js&quot;</arguments><workingdirectory>$escapedProject\server</workingdirectory><env name="CHROME_BIND_HOST" value="127.0.0.1"/><env name="UNIFIED_MCP_PSK_FILE" value="$escapedPsk"/>$noAuthEnvironment<env name="UNIFIED_MCP_KEEP_ALIVE" value="1"/><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><onfailure action="restart" delay="5 sec"/></service>
+<service><id>UnifiedMcpBackend</id><name>Unified MCP Backend</name><description>Unified MCP and multi-client Chrome CDP backend.</description><executable>$escapedNode</executable><arguments>&quot;$escapedProject\server\dist\index.js&quot;</arguments><workingdirectory>$escapedProject\server</workingdirectory><env name="CHROME_BIND_HOST" value="127.0.0.1"/><env name="UNIFIED_MCP_PSK_FILE" value="$escapedPsk"/><env name="UNIFIED_MCP_FS_CONFIG" value="$escapedFilesystemConfig"/>$noAuthEnvironment<env name="UNIFIED_MCP_KEEP_ALIVE" value="1"/><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><onfailure action="restart" delay="5 sec"/></service>
 "@
 $nginxXml = @"
 <service><id>UnifiedMcpNginx</id><name>Unified MCP nginx</name><description>TLS reverse proxy for Unified MCP.</description><executable>$escapedNginx</executable><arguments>-p &quot;$nginxPrefix&quot; -c conf/unified-mcp.conf</arguments><stopexecutable>$escapedNginx</stopexecutable><stoparguments>-p &quot;$nginxPrefix&quot; -s stop</stoparguments><workingdirectory>$nginxRootPath</workingdirectory><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><depend>UnifiedMcpBackend</depend><onfailure action="restart" delay="5 sec"/></service>
@@ -77,6 +84,7 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to restrict PSK directory permissions" 
 
 Write-Host "Unified MCP installed at https://$PublicHost`:9443/mcp"
 Write-Host "Import $certPath into Trusted Root Certification Authorities on each browser machine."
+Write-Host "Filesystem roots are configured in $filesystemConfigPath."
 if ($AllowNoAuth) {
   Write-Warning "Authentication is disabled. Keep port 9443 restricted to this machine."
 } else {
