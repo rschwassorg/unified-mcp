@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { HttpMcpUpstream } from "./mcp-upstream.js";
+import { filesystemCall, filesystemTools, ownsFilesystemTool } from "./filesystem.js";
 
 const require = createRequire(import.meta.url);
 const BRIDGE_PORT = Number(process.env.CHROME_MCP_PORT ?? 18765);
@@ -116,7 +117,7 @@ if (AGENT_API_HOST || AGENT_API_PORT) {
 }
 
 // MCP remains available over stdio for existing clients. HTTP is an additional interface.
-const localMcpTools = [
+const chromeMcpTools = [
   mcpTool("chrome_browsers_list", "List connected Chrome browser clients."),
   mcpTool("chrome_status", "Check whether the Chrome extension is connected."),
   mcpTool("chrome_tabs_list", "List open Chrome tabs."),
@@ -137,6 +138,7 @@ const localMcpTools = [
   mcpTool("chrome_cdp_call", "Send a CDP command with auto-attach.", { command: { type: "string" }, params: { type: "object", default: {} }, tabId: { type: "integer" }, targetId: { type: "string" }, extensionId: { type: "string" }, protocolVersion: { type: "string", default: "1.3" }, detach: { type: "boolean", default: false } }, ["command"]),
   mcpTool("chrome_cdp_events", "Poll buffered CDP events.", { limit: { type: "integer", default: 100 }, clear: { type: "boolean", default: false }, method: { type: "string" }, tabId: { type: "integer" }, targetId: { type: "string" }, extensionId: { type: "string" } })
 ];
+const localMcpTools = [...chromeMcpTools, ...filesystemTools];
 const readline = createInterface({ input: process.stdin, crlfDelay: Infinity });
 readline.on("line", (line) => { void handleMcpLine(line); });
 readline.on("close", () => { if (process.env.UNIFIED_MCP_KEEP_ALIVE !== "1") shutdown(); });
@@ -167,6 +169,7 @@ async function mcpCall(name: string, args: Record<string, unknown>) {
   };
   if (name === "chrome_status" || name === "chrome_browsers_list") return mcpText(serverStatus());
   if (name === "chrome_cdp_protocol") return mcpText(getCdpProtocol(args));
+  if (ownsFilesystemTool(name)) return mcpText(await filesystemCall(name, args));
   if (vibeTermMcp?.ownsTool(name)) return vibeTermMcp.callTool(name, args);
   if (!method[name]) throw new Error(`Unknown tool: ${name}`);
   const defaults = name === "chrome_page_type" ? { clear: true } : name === "chrome_cdp_attach" ? { protocolVersion: "1.3" } : name === "chrome_cdp_send" || name === "chrome_cdp_call" ? { params: {}, autoAttach: true, protocolVersion: "1.3" } : {};
