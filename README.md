@@ -20,7 +20,7 @@ nginx terminates TLS but does not execute MCP logic. On Windows, nginx and the N
 - The PSK is never written into nginx configuration, service XML, logs, or source control.
 - The included certificate is self-signed. Import its public `.crt` into Trusted Root Certification Authorities on every client machine. Replace it with a trusted certificate before wider use.
 
-Anyone holding the PSK can fully control connected browsers. Use a firewall allowlist, rotate the PSK if exposed, and do not expose port 9443 directly to the public internet.
+Anyone holding the PSK can fully control connected browsers and any configured writable filesystem roots. Use a firewall allowlist, rotate the PSK if exposed, expose only the minimum required filesystem roots, and do not expose port 9443 directly to the public internet.
 
 ### Temporary local no-auth mode
 
@@ -62,7 +62,7 @@ cd C:\path\to\chrome-cdp-bridge
   -PublicHost localhost
 ```
 
-The installer builds the backend, creates the PSK and certificate if absent, validates nginx, and installs `UnifiedMcpBackend` followed by `UnifiedMcpNginx`. It does not print the PSK. To remove only the services while retaining configuration, certificates, secrets, and logs:
+The installer builds the backend, creates the PSK and certificate if absent, validates nginx, creates `%ProgramData%\\UnifiedMcp\\filesystem-roots.json` if absent, and installs `UnifiedMcpBackend` followed by `UnifiedMcpNginx`. The default filesystem config exposes the installing user's `code` directory as a writable root named `code`; edit that file to narrow or expand agent access. It does not print the PSK. To remove only the services while retaining configuration, certificates, secrets, and logs:
 
 ```powershell
 .\deploy\windows\uninstall.ps1
@@ -106,13 +106,42 @@ The existing stdio MCP interface remains available for local compatibility:
 }
 ```
 
+## Filesystem tools
+
+The gateway can expose selected local directories to MCP agents through named roots. Filesystem access is disabled until a valid roots configuration exists. The Windows service installer creates:
+
+```text
+%ProgramData%\UnifiedMcp\filesystem-roots.json
+```
+
+Example:
+
+```json
+{
+  "roots": {
+    "code": {
+      "path": "C:\\Users\\rober\\code",
+      "readOnly": false
+    },
+    "documents": {
+      "path": "C:\\Users\\rober\\Documents",
+      "readOnly": true
+    }
+  }
+}
+```
+
+Available tools are `fs_roots_list`, `fs_list`, `fs_stat`, `fs_read_text`, `fs_write_text`, `fs_replace_text`, `fs_mkdir`, and `fs_move`. Agents address files using a root name plus a relative path; absolute paths, UNC paths, parent traversal, and resolved symlink/junction escapes are rejected. Reads and writes default to a 4 MiB maximum file size, directory listings are capped at 1,000 entries, writes can use an `expectedSha256` guard to prevent lost updates, and modifying operations are appended to `%ProgramData%\\UnifiedMcp\\logs\\filesystem-audit.log`.
+
+`fs_replace_text` performs exact-match replacement and can require an expected occurrence count, which is safer for agent-driven edits than line-number based patches. Deletion is intentionally not exposed.
+
 ## REST and health
 
 Open `https://localhost:9443/` for a live dashboard of connected browser clients, heartbeat times, and bridge metrics.
 
 `GET /health` is intentionally unauthenticated and returns service/browser connection metadata. `/v1/*` and `/openapi.json` require the Bearer PSK. Select a browser using `X-Browser-Id`, `?browserId=...`, or `browserId` in a JSON body.
 
-The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables are `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
+The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
 
 ## Add more unified tools
 
