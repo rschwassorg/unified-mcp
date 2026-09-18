@@ -1,5 +1,5 @@
-const DEFAULT_SERVER_URL = "ws://127.0.0.1:18767";
-const LEGACY_SERVER_URL = "wss://localhost:9443/bridge";
+const DEFAULT_SERVER_URL = "wss://unified-mcp.pentestsystem.com/bridge";
+const LEGACY_SERVER_URLS = new Set(["wss://localhost:9443/bridge", "ws://127.0.0.1:18767"]);
 const RECONNECT_ALARM = "chrome-mcp-reconnect";
 const HEARTBEAT_MS = 20000;
 const RECONNECT_MS = 15000;
@@ -18,8 +18,8 @@ const attachedDebuggees = new Map();
 let connectionSettings = null;
 
 async function getConnectionSettings() {
-  const stored = await chrome.storage.local.get(["serverUrl", "browserId", "browserName", "psk"]);
-  const serverUrl = !stored.serverUrl || stored.serverUrl === LEGACY_SERVER_URL
+  const stored = await chrome.storage.local.get(["serverUrl", "browserId", "browserName"]);
+  const serverUrl = !stored.serverUrl || LEGACY_SERVER_URLS.has(stored.serverUrl)
     ? DEFAULT_SERVER_URL
     : stored.serverUrl;
   if (stored.serverUrl !== serverUrl) await chrome.storage.local.set({ serverUrl });
@@ -31,8 +31,7 @@ async function getConnectionSettings() {
   return {
     serverUrl,
     browserId,
-    browserName: stored.browserName || `Chrome ${browserId.slice(0, 8)}`,
-    psk: stored.psk || ""
+    browserName: stored.browserName || `Chrome ${browserId.slice(0, 8)}`
   };
 }
 
@@ -78,7 +77,7 @@ async function connect() {
 
   nextSocket.addEventListener("open", () => {
     lastError = null;
-    send({ type: "hello", role: "extension", browserId: connectionSettings.browserId, browserName: connectionSettings.browserName, psk: connectionSettings.psk });
+    send({ type: "hello", role: "extension", browserId: connectionSettings.browserId, browserName: connectionSettings.browserName });
     void setStatus(true);
     startHeartbeat();
   });

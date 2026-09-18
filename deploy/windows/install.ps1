@@ -1,10 +1,9 @@
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory)] [string] $NginxRoot,
   [Parameter(Mandatory)] [string] $WinSWExe,
   [string] $NodeExe = (Get-Command node -ErrorAction Stop).Source,
-  [string] $OpenSslExe = (Get-Command openssl -ErrorAction Stop).Source,
-  [string] $PublicHost = "localhost",
+  [string] $BindHost = "127.0.0.1",
+  [int] $Port = 18766,
   [string] $CloudflareAccessTeamDomain = "",
   [string] $CloudflareAccessAudience = "",
   [switch] $AllowNoAuth
@@ -12,62 +11,36 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$nginxRootPath = (Resolve-Path $NginxRoot).Path
 $winswPath = (Resolve-Path $WinSWExe).Path
 $nodePath = (Resolve-Path $NodeExe).Path
-$opensslPath = (Resolve-Path $OpenSslExe).Path
 $serviceRoot = Join-Path $env:ProgramData "UnifiedMcp"
-$secretRoot = Join-Path $serviceRoot "secrets"
-$certRoot = Join-Path $serviceRoot "certs"
 $logRoot = Join-Path $serviceRoot "logs"
 $filesystemConfigPath = Join-Path $serviceRoot "filesystem-roots.json"
 
-New-Item -ItemType Directory -Force -Path $serviceRoot,$secretRoot,$certRoot,$logRoot | Out-Null
+if ($Port -lt 1 -or $Port -gt 65535) {
+  throw "Port must be between 1 and 65535"
+}
+
+New-Item -ItemType Directory -Force -Path $serviceRoot,$logRoot | Out-Null
 if (-not (Test-Path -LiteralPath $filesystemConfigPath)) {
   $defaultCodeRoot = Join-Path $env:USERPROFILE "code"
   $filesystemConfig = @{ roots = @{ code = @{ path = $defaultCodeRoot; readOnly = $false } } } | ConvertTo-Json -Depth 5
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($filesystemConfigPath, $filesystemConfig, $utf8NoBom)
 }
+
+Write-Host "Phase: build"
 npm --prefix (Join-Path $projectRoot "server") ci
+if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
 npm --prefix (Join-Path $projectRoot "server") run build
+if ($LASTEXITCODE -ne 0) { throw "npm build failed" }
 
-Write-Host "Phase: PSK storage"
-$pskPath = Join-Path $secretRoot "psk.txt"
-if (-not (Test-Path -LiteralPath $pskPath)) {
-  $bytes = New-Object byte[] 32
-  $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
-  $generator.GetBytes($bytes)
-  $generator.Dispose()
-  [Convert]::ToBase64String($bytes) | Set-Content -LiteralPath $pskPath -NoNewline -Encoding ascii
-}
-$certPath = Join-Path $certRoot "unified-mcp.crt"
-$keyPath = Join-Path $certRoot "unified-mcp.key"
-Write-Host "Phase: TLS certificate"
-if (-not (Test-Path -LiteralPath $certPath) -or -not (Test-Path -LiteralPath $keyPath)) {
-  & $opensslPath req -x509 -newkey rsa:3072 -sha256 -days 825 -nodes -keyout $keyPath -out $certPath -subj "/CN=$PublicHost" -addext "subjectAltName=DNS:$PublicHost,DNS:localhost,IP:127.0.0.1"
-  if ($LASTEXITCODE -ne 0) { throw "OpenSSL certificate generation failed" }
-}
-
-$nginxTemplate = Get-Content -Raw -LiteralPath (Join-Path $projectRoot "deploy\nginx\unified-mcp.conf.template")
-Write-Host "Phase: nginx configuration"
-$nginxConfig = $nginxTemplate.Replace("__CERTIFICATE__", $certPath.Replace("\", "/")).Replace("__PRIVATE_KEY__", $keyPath.Replace("\", "/"))
-$nginxConfigPath = Join-Path $nginxRootPath "conf\unified-mcp.conf"
-Set-Content -LiteralPath $nginxConfigPath -Value $nginxConfig -Encoding ascii
-
-$escapedProject = [Security.SecurityElement]::Escape($projectRoot)
-$escapedNode = [Security.SecurityElement]::Escape($nodePath)
-$escapedPsk = [Security.SecurityElement]::Escape($pskPath)
-$escapedFilesystemConfig = [Security.SecurityElement]::Escape($filesystemConfigPath)
-$escapedNginx = [Security.SecurityElement]::Escape((Join-Path $nginxRootPath "nginx.exe"))
-$nginxPrefix = $nginxRootPath.Replace("\", "/") + "/"
-$noAuthEnvironment = if ($AllowNoAuth) { '<env name="UNIFIED_MCP_ALLOW_NO_AUTH" value="true"/>' } else { '' }
-$accessEnvironment = ''
+$accessEnvironment = ""
 if ($CloudflareAccessTeamDomain -or $CloudflareAccessAudience) {
   if (-not $CloudflareAccessTeamDomain -or -not $CloudflareAccessAudience) {
     throw "CloudflareAccessTeamDomain and CloudflareAccessAudience must be configured together"
   }
-  $normalizedAccessTeam = $CloudflareAccessTeamDomain.TrimEnd('/')
+  $normalizedAccessTeam = $CloudflareAccessTeamDomain.TrimEnd("/")
   if ($normalizedAccessTeam -notmatch '^https://[^/]+\.cloudflareaccess\.com$') {
     throw "CloudflareAccessTeamDomain must be an https://*.cloudflareaccess.com origin"
   }
@@ -75,38 +48,48 @@ if ($CloudflareAccessTeamDomain -or $CloudflareAccessAudience) {
   $escapedAccessAud = [Security.SecurityElement]::Escape($CloudflareAccessAudience)
   $accessEnvironment = '<env name="UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN" value="' + $escapedAccessTeam + '"/><env name="UNIFIED_MCP_CF_ACCESS_AUD" value="' + $escapedAccessAud + '"/>'
 }
+elseif (-not $AllowNoAuth) {
+  throw "Cloudflare Access is required unless -AllowNoAuth is explicitly specified"
+}
+
+$escapedProject = [Security.SecurityElement]::Escape($projectRoot)
+$escapedNode = [Security.SecurityElement]::Escape($nodePath)
+$escapedFilesystemConfig = [Security.SecurityElement]::Escape($filesystemConfigPath)
+$escapedBindHost = [Security.SecurityElement]::Escape($BindHost)
+$noAuthEnvironment = if ($AllowNoAuth) { '<env name="UNIFIED_MCP_ALLOW_NO_AUTH" value="true"/>' } else { '' }
+
 $backendXml = @"
-<service><id>UnifiedMcpBackend</id><name>Unified MCP Backend</name><description>Unified MCP and multi-client Chrome CDP backend.</description><executable>$escapedNode</executable><arguments>&quot;$escapedProject\server\dist\index.js&quot;</arguments><workingdirectory>$escapedProject\server</workingdirectory><env name="CHROME_BIND_HOST" value="127.0.0.1"/><env name="UNIFIED_MCP_PSK_FILE" value="$escapedPsk"/><env name="UNIFIED_MCP_FS_CONFIG" value="$escapedFilesystemConfig"/>$accessEnvironment$noAuthEnvironment<env name="UNIFIED_MCP_KEEP_ALIVE" value="1"/><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><onfailure action="restart" delay="5 sec"/></service>
-"@
-$nginxXml = @"
-<service><id>UnifiedMcpNginx</id><name>Unified MCP nginx</name><description>TLS reverse proxy for Unified MCP.</description><executable>$escapedNginx</executable><arguments>-p &quot;$nginxPrefix&quot; -c conf/unified-mcp.conf</arguments><stopexecutable>$escapedNginx</stopexecutable><stoparguments>-p &quot;$nginxPrefix&quot; -s stop</stoparguments><workingdirectory>$nginxRootPath</workingdirectory><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><depend>UnifiedMcpBackend</depend><onfailure action="restart" delay="5 sec"/></service>
+<service><id>UnifiedMcpBackend</id><name>Unified MCP Backend</name><description>Unified MCP HTTP and WebSocket backend for Cloudflare Tunnel.</description><executable>$escapedNode</executable><arguments>&quot;$escapedProject\server\dist\index.js&quot;</arguments><workingdirectory>$escapedProject\server</workingdirectory><env name="UNIFIED_MCP_BIND_HOST" value="$escapedBindHost"/><env name="UNIFIED_MCP_PORT" value="$Port"/><env name="UNIFIED_MCP_FS_CONFIG" value="$escapedFilesystemConfig"/>$accessEnvironment$noAuthEnvironment<env name="UNIFIED_MCP_ALLOW_LOOPBACK_NO_AUTH" value="true"/><env name="UNIFIED_MCP_KEEP_ALIVE" value="1"/><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><onfailure action="restart" delay="5 sec"/></service>
 "@
 
-Write-Host "Phase: Windows services"
-foreach ($service in @(@{Name="UnifiedMcpBackend"; Xml=$backendXml}, @{Name="UnifiedMcpNginx"; Xml=$nginxXml})) {
-  $exe = Join-Path $serviceRoot ($service.Name + ".exe")
-  $xml = Join-Path $serviceRoot ($service.Name + ".xml")
-  Copy-Item -Force -LiteralPath $winswPath -Destination $exe
-  Set-Content -LiteralPath $xml -Value $service.Xml -Encoding utf8
-  & $exe stop 2>$null
-  & $exe uninstall 2>$null
-  & $exe install
-  & $exe start
+Write-Host "Phase: remove legacy nginx service"
+$legacyNginxExe = Join-Path $serviceRoot "UnifiedMcpNginx.exe"
+if (Test-Path -LiteralPath $legacyNginxExe) {
+  & $legacyNginxExe stop 2>$null
+  & $legacyNginxExe uninstall 2>$null
 }
 
-Write-Host "Phase: ACL hardening"
-& icacls.exe $secretRoot /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Failed to restrict PSK directory permissions" }
+Write-Host "Phase: Windows service"
+$backendExe = Join-Path $serviceRoot "UnifiedMcpBackend.exe"
+$backendXmlPath = Join-Path $serviceRoot "UnifiedMcpBackend.xml"
+Copy-Item -Force -LiteralPath $winswPath -Destination $backendExe
+Set-Content -LiteralPath $backendXmlPath -Value $backendXml -Encoding utf8
+& $backendExe stop 2>$null
+& $backendExe uninstall 2>$null
+& $backendExe install
+if ($LASTEXITCODE -ne 0) { throw "Failed to install UnifiedMcpBackend" }
+& $backendExe start
+if ($LASTEXITCODE -ne 0) { throw "Failed to start UnifiedMcpBackend" }
 
-Write-Host "Unified MCP installed at https://$PublicHost`:9443/mcp"
-Write-Host "Import $certPath into Trusted Root Certification Authorities on each browser machine."
-Write-Host "Filesystem roots are configured in $filesystemConfigPath."
+Write-Host "Unified MCP is listening on http://$($BindHost):$Port"
+Write-Host "HTTP MCP endpoint: http://$($BindHost):$Port/mcp"
+Write-Host "WebSocket bridge: ws://$($BindHost):$Port/bridge"
+Write-Host "Filesystem roots: $filesystemConfigPath"
 if ($AllowNoAuth) {
-  Write-Warning "Authentication is disabled. Keep port 9443 restricted to this machine."
+  Write-Warning "Authentication is disabled. Do not expose this listener outside a trusted local environment."
 } else {
-  Write-Host "The Chrome bridge PSK is stored at $pskPath and was intentionally not printed."
-}
-if ($CloudflareAccessTeamDomain) {
-  Write-Host "HTTP MCP authentication: Cloudflare Access Managed OAuth"
+  Write-Host "Authentication: Cloudflare Access JWT validation for HTTP and WebSocket upgrades"
   Write-Host "Cloudflare Access team: $($CloudflareAccessTeamDomain.TrimEnd('/'))"
+  Write-Host "Publish this single origin through Cloudflare Tunnel: http://127.0.0.1:$Port"
 }
+Write-Host "TLS is intentionally not configured locally; Cloudflare terminates public HTTPS/WSS."

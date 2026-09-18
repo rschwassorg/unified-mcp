@@ -1,5 +1,5 @@
 import { appendFileSync, readFileSync } from "node:fs";
-import { timingSafeEqual } from "node:crypto";
+import type { Duplex } from "node:stream";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -11,9 +11,8 @@ import { filesystemCall, filesystemTools, ownsFilesystemTool } from "./filesyste
 import { CloudflareAccessError, CloudflareAccessValidator } from "./cloudflare-access.js";
 
 const require = createRequire(import.meta.url);
-const BRIDGE_PORT = Number(process.env.CHROME_MCP_PORT ?? 18765);
-const API_PORT = Number(process.env.CHROME_API_PORT ?? 18766);
-const BIND_HOST = process.env.CHROME_BIND_HOST ?? "127.0.0.1";
+const SERVER_PORT = Number(process.env.UNIFIED_MCP_PORT ?? process.env.CHROME_API_PORT ?? 18766);
+const BIND_HOST = process.env.UNIFIED_MCP_BIND_HOST ?? process.env.CHROME_BIND_HOST ?? "127.0.0.1";
 const AGENT_API_HOST = process.env.CHROME_AGENT_API_HOST || "";
 const AGENT_API_PORT = Number(process.env.CHROME_AGENT_API_PORT ?? 0);
 const REQUEST_TIMEOUT_MS = Number(process.env.CHROME_MCP_TIMEOUT_MS ?? 15000);
@@ -26,7 +25,7 @@ const CF_ACCESS_CERTS_URL = process.env.UNIFIED_MCP_CF_ACCESS_CERTS_URL || "";
 
 type ChromeRequest = { type: "request"; id: string; method: string; params?: Record<string, unknown> };
 type ChromeResponse = { type: "response"; id: string; ok: boolean; result?: unknown; error?: string };
-type BridgeMessage = ChromeResponse | { type: "heartbeat"; time?: number } | { type: "hello"; role: "extension"; browserId?: string; browserName?: string; psk?: string };
+type BridgeMessage = ChromeResponse | { type: "heartbeat"; time?: number } | { type: "hello"; role: "extension"; browserId?: string; browserName?: string };
 type ProtocolDomain = { domain: string; description?: string; experimental?: boolean; deprecated?: boolean; dependencies?: string[]; types?: unknown[]; commands?: unknown[]; events?: unknown[] };
 type ProtocolDefinition = { version: { major: string; minor: string }; domains: ProtocolDomain[] };
 type JsonRpcRequest = { jsonrpc: "2.0"; id?: string | number; method: string; params?: Record<string, unknown> };
@@ -35,7 +34,6 @@ const browserProtocol = require("devtools-protocol/json/browser_protocol.json") 
 const jsProtocol = require("devtools-protocol/json/js_protocol.json") as ProtocolDefinition;
 const cdpProtocol: ProtocolDefinition = { version: browserProtocol.version, domains: [...browserProtocol.domains, ...jsProtocol.domains] };
 
-const PSK = process.env.UNIFIED_MCP_PSK || (process.env.UNIFIED_MCP_PSK_FILE ? readFileSync(process.env.UNIFIED_MCP_PSK_FILE, "utf8").trim() : "");
 const ALLOW_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_NO_AUTH === "true";
 const ALLOW_LOOPBACK_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_LOOPBACK_NO_AUTH === "true";
 const cloudflareAccess = CF_ACCESS_TEAM_DOMAIN && CF_ACCESS_AUD ? new CloudflareAccessValidator({
@@ -51,11 +49,11 @@ let shuttingDown = false;
 const vibeTermMcp = process.env.VIBETERM_MCP_DISABLED === "true" ? undefined : new HttpMcpUpstream(
   "vibeterm",
   VIBETERM_MCP_URL,
-  process.env.VIBETERM_API_TOKEN || PSK,
+  process.env.VIBETERM_API_TOKEN || "",
   Number(process.env.VIBETERM_MCP_TIMEOUT_MS ?? 5000)
 );
 
-const wss = new WebSocketServer({ host: BIND_HOST, port: BRIDGE_PORT });
+const wss = new WebSocketServer({ noServer: true });
 wss.on("error", (error) => {
   debug("websocket-error", { message: error.message });
   console.error(`Chrome bridge WebSocket failed: ${error.message}`);
@@ -69,8 +67,8 @@ wss.on("connection", (socket) => {
     let message: BridgeMessage;
     try { message = JSON.parse(data.toString()) as BridgeMessage; } catch { return; }
     if (message.type === "hello") {
-      if (!message.browserId || (!ALLOW_NO_AUTH && (!PSK || !safeEqual(message.psk || "", PSK)))) {
-        socket.close(1008, "Authentication failed");
+      if (!message.browserId) {
+        socket.close(1008, "browserId is required");
         return;
       }
       registerBrowser(socket, message.browserId, message.browserName || message.browserId);
@@ -106,7 +104,8 @@ wss.on("connection", (socket) => {
 
 const apiHandler = (request: IncomingMessage, response: ServerResponse) => { void handleHttp(request, response); };
 const api = createServer(apiHandler);
-api.listen(API_PORT, BIND_HOST, () => debug("api-start", { apiPort: API_PORT, bridgePort: BRIDGE_PORT, bindHost: BIND_HOST, pid: process.pid }));
+api.on("upgrade", (request, socket, head) => { void handleUpgrade(request, socket, head); });
+api.listen(SERVER_PORT, BIND_HOST, () => debug("api-start", { port: SERVER_PORT, bindHost: BIND_HOST, pid: process.pid }));
 api.on("error", (error) => {
   debug("api-error", { message: error.message });
   console.error(`Chrome API failed: ${error.message}`);
@@ -194,8 +193,8 @@ async function unifiedMcpTools() {
 async function handleHttp(request: IncomingMessage, response: ServerResponse) {
   const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
   try {
-    if (request.method === "GET" && ["/", "/app.js", "/styles.css"].includes(url.pathname)) return sendDashboardAsset(response, url.pathname);
-    if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, serverStatus());
+    if (request.method === "GET" && ["/", "/app.js", "/styles.css"].includes(url.pathname)) { await authorize(request); return sendDashboardAsset(response, url.pathname); }
+    if (request.method === "GET" && url.pathname === "/health") { await authorize(request); return sendJson(response, 200, serverStatus()); }
     if (request.method === "GET" && url.pathname === "/openapi.json") { await authorize(request); return sendJson(response, 200, openApi()); }
     if (url.pathname === "/mcp") {
       await authorize(request);
@@ -216,6 +215,22 @@ async function handleHttp(request: IncomingMessage, response: ServerResponse) {
     const status = error instanceof HttpError ? error.status : 500;
     const headers = error instanceof HttpError ? error.headers : {};
     sendJson(response, status, { error: errorMessage(error) }, headers);
+  }
+}
+
+async function handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer) {
+  try {
+    const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
+    if (url.pathname !== "/bridge") throw new HttpError(404, "WebSocket bridge not found");
+    await authorize(request);
+    wss.handleUpgrade(request, socket, head, (websocket) => {
+      wss.emit("connection", websocket, request);
+    });
+  } catch (error) {
+    const status = error instanceof HttpError ? error.status : 500;
+    const reason = status === 401 ? "Unauthorized" : status === 403 ? "Forbidden" : status === 404 ? "Not Found" : "Internal Server Error";
+    try { socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch {}
+    socket.destroy();
   }
 }
 
@@ -278,7 +293,7 @@ function openApi() {
   const response = { "200": { description: "Successful Chrome response", content: { "application/json": { schema: json } } }, "503": { description: "Chrome extension unavailable" } };
   return {
     openapi: "3.1.0", info: { title: "Chrome CDP Bridge API", version: "1.0.0", description: "A local REST bridge to Chrome's chrome.debugger CDP API. The server binds to 127.0.0.1 only." },
-    servers: [{ url: `http://127.0.0.1:${API_PORT}` }],
+    servers: [{ url: `http://127.0.0.1:${SERVER_PORT}` }],
     paths: {
       "/health": { get: { summary: "Get bridge health", responses: response } },
       "/v1/tabs": { get: { summary: "List tabs", responses: response }, post: { summary: "Open a tab", ...body({ type: "object", required: ["url"], properties: { url: { type: "string", format: "uri" }, active: { type: "boolean", default: true } } }), responses: response } },
@@ -316,7 +331,7 @@ function mcpTool(name: string, description: string, properties: Record<string, u
 function mcpText(value: unknown) { return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] }; }
 function respondMcp(id: string | number, result: unknown) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`); }
 function respondMcpError(id: string | number, message: string) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`); }
-function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], apiPort: API_PORT, bridgePort: BRIDGE_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : cloudflareAccess ? "cloudflare-access-http+psk-browser" : ALLOW_LOOPBACK_NO_AUTH ? "psk-with-loopback-bypass" : "psk", cloudflareAccessTeam: cloudflareAccess?.teamDomain }; }
+function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], port: SERVER_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : cloudflareAccess ? "cloudflare-access" : ALLOW_LOOPBACK_NO_AUTH ? "loopback-only" : "unconfigured", cloudflareAccessTeam: cloudflareAccess?.teamDomain }; }
 function registerBrowser(socket: WebSocket, id: string, name: string) {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(id)) return socket.close(1008, "Invalid browserId");
   const previous = browsers.get(id);
@@ -336,18 +351,13 @@ function selectBrowser(value: unknown) {
 async function authorize(request: IncomingMessage) {
   if (ALLOW_NO_AUTH) return;
   if (ALLOW_LOOPBACK_NO_AUTH && isDirectLoopbackRequest(request)) return;
-  if (cloudflareAccess) {
-    try {
-      await cloudflareAccess.authenticate(request);
-      return;
-    } catch (error) {
-      if (error instanceof CloudflareAccessError) throw new HttpError(error.status, error.message);
-      throw error;
-    }
+  if (!cloudflareAccess) throw new HttpError(503, "Cloudflare Access authentication is not configured");
+  try {
+    await cloudflareAccess.authenticate(request);
+  } catch (error) {
+    if (error instanceof CloudflareAccessError) throw new HttpError(error.status, error.message);
+    throw error;
   }
-  if (!PSK) throw new HttpError(503, "Unified MCP HTTP authentication is not configured");
-  const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!safeEqual(supplied, PSK)) throw new HttpError(401, "Unauthorized");
 }
 function isDirectLoopbackRequest(request: IncomingMessage) {
   const remoteAddress = request.socket.remoteAddress || "";
@@ -358,10 +368,6 @@ function isDirectLoopbackRequest(request: IncomingMessage) {
   } catch {
     return false;
   }
-}
-function safeEqual(left: string, right: string) {
-  const a = Buffer.from(left); const b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
 }
 function sendJson(response: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}) { response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...headers }).end(JSON.stringify(value)); }
 function sendDashboardAsset(response: ServerResponse, path: string) {

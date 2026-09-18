@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Chrome MCP",
-  "version": "0.1.0",
-  "description": "Connect Chrome tabs to a local MCP server.",
+  "version": "0.2.0",
+  "description": "Connect Chrome to Unified MCP through Cloudflare Access.",
   "permissions": ["activeTab", "alarms", "debugger", "scripting", "tabs", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": {
