@@ -1,5 +1,5 @@
 import { appendFileSync, readFileSync } from "node:fs";
-import type { Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -218,7 +218,7 @@ async function handleHttp(request: IncomingMessage, response: ServerResponse) {
   }
 }
 
-async function handleUpgrade(request: IncomingMessage, socket: Socket, head: Buffer) {
+async function handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer) {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
     if (url.pathname !== "/bridge") throw new HttpError(404, "WebSocket bridge not found");
