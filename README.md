@@ -1,118 +1,181 @@
-# Unified MCP with multi-client Chrome CDP
+# Unified MCP
 
-This repository runs an extensible local MCP server behind an nginx HTTPS endpoint. Chrome CDP is its first tool family. Any number of Chrome profiles or remote browser machines can check in over authenticated WSS, and every Chrome tool accepts a `browserId` to route work to a specific browser.
+Unified MCP is a local HTTP MCP server that publishes Chrome/CDP and filesystem tools through one Cloudflare-protected endpoint.
+
+The local process intentionally does **not** terminate TLS. It listens on loopback HTTP only. Cloudflare Tunnel carries traffic to the machine, Cloudflare terminates public HTTPS/WSS, and Cloudflare Access provides authentication.
 
 ```text
-MCP clients  -- HTTPS /mcp ---+--> nginx :9443 --> Node backend (loopback only)
-REST clients -- HTTPS /v1 ----+                         +--> VibeTerm MCP :47821
-Chrome A ----- WSS /bridge ---+                         +--> browser registry
-Chrome B ----- WSS /bridge ---+                         +--> Chrome CDP tools
+MCP clients ---- HTTPS /mcp ----+
+REST clients --- HTTPS /v1 -----+--> Cloudflare Access
+Browser clients - WSS /bridge --+         |
+                                          v
+                                  Cloudflare Tunnel
+                                          |
+                                          v
+                                  http://127.0.0.1:18766
+                                          |
+                                          +--> MCP / REST
+                                          +--> WebSocket bridge
+                                          +--> browser registry
+                                          +--> Chrome CDP tools
+                                          +--> filesystem tools
+                                          +--> optional VibeTerm upstream
 ```
 
-nginx terminates TLS but does not execute MCP logic. On Windows, nginx and the Node backend therefore run as two automatic services. Both backend ports remain on `127.0.0.1`.
+There is no nginx requirement, no local HTTPS certificate, and no Unified MCP PSK in the production design.
 
-## Security model
+## Authentication model
 
-- TLS is required on the exposed listener.
-- Browsers authenticate in their first WSS message with a pre-shared key. The Chrome bridge keeps this PSK on `/bridge`.
-- HTTP MCP/REST requests can be protected by Cloudflare Access Managed OAuth. The origin validates the `Cf-Access-Jwt-Assertion` JWT from Access and does not use the Chrome PSK for HTTP when Access validation is configured.
-- The Windows installer generates a 256-bit Chrome PSK under `%ProgramData%\UnifiedMcp\secrets`, accessible only to SYSTEM and Administrators.
-- The PSK is never written into nginx configuration, service XML, logs, or source control.
-- The included certificate is self-signed. Import its public `.crt` into Trusted Root Certification Authorities on every client machine. Replace it with a trusted certificate before wider use.
+Cloudflare Access is the authentication boundary for both MCP HTTP traffic and WebSocket upgrades.
 
-Anyone holding the Chrome PSK can connect a browser bridge client. HTTP MCP/REST access is controlled independently by Cloudflare Access when configured. Expose only the minimum required filesystem roots and keep the public MCP endpoint behind the intended Cloudflare Tunnel and Access policy.
+When Access is configured, Unified MCP validates the signed `Cf-Access-Jwt-Assertion` that Cloudflare adds to authenticated origin requests. Validation checks the RS256 signature, issuer, application audience, and token lifetime against the Access team's signing keys.
 
-### Temporary local no-auth mode
+The production paths are:
 
-For a loopback-only development installation, set
-`UNIFIED_MCP_ALLOW_NO_AUTH=true`. This explicitly bypasses PSK checks for the
-WSS bridge, MCP, and REST endpoints. The Windows installer accepts
-`-AllowNoAuth` to set this service environment variable. Do not use this mode
-on a listener reachable from another machine.
+```text
+https://unified-mcp.pentestsystem.com/mcp
+    Cloudflare Access Managed OAuth -> HTTP MCP
 
-Without administrator access, run `deploy/windows/start-no-auth.ps1`. It binds
-the browser bridge to `ws://127.0.0.1:18767` and the MCP/REST API to
-`http://127.0.0.1:18768`. Reload the unpacked extension once so it migrates
-from the legacy WSS service URL to this loopback-only endpoint.
+wss://unified-mcp.pentestsystem.com/bridge
+    Cloudflare Access browser session -> WebSocket bridge
+```
 
-For an authenticated user-scoped launch without installing Windows services,
-run `deploy/windows/start-authenticated.ps1`. It creates a 256-bit PSK under
-`%LOCALAPPDATA%\UnifiedMcp\secrets`, restricts that directory to the current
-Windows identity, and starts the same loopback endpoints with bearer
-authentication enabled. `ensure-user-psk.ps1 -CopyToClipboard` copies the PSK
-without printing it so it can be entered into the extension or a trusted
-reverse proxy. Direct local MCP calls whose connection and HTTP Host are both
-loopback may omit the PSK; requests forwarded for a public hostname still
-require it.
+For direct loopback diagnostics, the Windows service enables the loopback-only bypass. A request only qualifies when both the TCP peer and HTTP Host are loopback. A Tunnel request arrives over loopback but retains the public Host, so it still requires Cloudflare Access.
 
-To start the authenticated server and its named Cloudflare Tunnel whenever the
-current user signs in, run `deploy/windows/install-user-autostart.ps1`. The
-scheduled tasks run with limited current-user privileges and restart failed
-processes without embedding the PSK in task definitions or command lines.
+### Which Cloudflare auth mechanism to use
+
+Use the Cloudflare mechanism that matches the client:
+
+- **MCP clients, CLIs, SDKs, and agents:** enable **Managed OAuth** on the Access application. Standards-compatible clients can perform OAuth/PKCE without storing a Unified MCP secret.
+- **Chrome/browser extensions:** authenticate interactively to the Access-protected hostname. Cloudflare sets the `CF_Authorization` application cookie; the browser then sends that session during the WebSocket handshake and Access injects `Cf-Access-Jwt-Assertion` at the origin.
+- **Headless automation that can send custom HTTP headers:** use a Cloudflare Access **Service Token** with a Service Auth policy. Do not embed a service-token client secret in a distributed browser extension.
+
+Browser WebSocket APIs cannot attach arbitrary authorization headers, so the extension uses the Access browser session rather than a static service token or PSK.
+
+## Cloudflare configuration
+
+### 1. Cloudflare Tunnel
+
+Create one published application route:
+
+```text
+Hostname:
+unified-mcp.pentestsystem.com
+
+Service:
+http://127.0.0.1:18766
+```
+
+Do not use `https://127.0.0.1` for the origin. Cloudflare handles public TLS and the local hop never leaves the machine.
+
+The same route carries normal HTTP and WebSocket upgrade traffic. No separate WebSocket origin port is required.
+
+If you manage DNS manually, the proxied CNAME points at the active Tunnel UUID:
+
+```text
+unified-mcp -> <TUNNEL-UUID>.cfargotunnel.com
+```
+
+### 2. Cloudflare Access
+
+Create an Access application covering the Unified MCP hostname, not only `/mcp`:
+
+```text
+unified-mcp.pentestsystem.com
+```
+
+Recommended settings:
+
+- Allow policy restricted to the intended user identity.
+- **Managed OAuth: enabled** so MCP/CLI clients can authenticate.
+- Application cookie **SameSite: None** for cross-origin browser-extension WebSocket connections.
+- Keep the application Audience (AUD) tag; the Windows service uses it to validate Access JWTs.
+
+The origin does not implement its own OAuth authorization server. Cloudflare Access owns the OAuth flow.
 
 ## Windows service install
 
-Prerequisites are Node.js/npm, nginx for Windows, a [WinSW](https://github.com/winsw/winsw/releases) executable, OpenSSL 1.1.1+, and an elevated PowerShell prompt.
+Prerequisites are Node.js/npm and a WinSW executable. nginx and OpenSSL are no longer required.
+
+Run from an elevated PowerShell:
 
 ```powershell
-cd C:\path\to\chrome-cdp-bridge
+cd C:\Users\rober\code\unified-mcp
+git pull origin main
+
 .\deploy\windows\install.ps1 `
-  -NginxRoot C:\tools\nginx `
-  -WinSWExe C:\tools\WinSW-x64.exe `
-  -PublicHost localhost `
+  -WinSWExe "C:\ProgramData\UnifiedMcp\tools\winsw\winsw.exe" `
   -CloudflareAccessTeamDomain "https://bitter-surf-66e7.cloudflareaccess.com" `
   -CloudflareAccessAudience "<ACCESS_APP_AUD_TAG>"
 ```
 
-The installer builds the backend, creates the Chrome PSK and certificate if absent, validates nginx, creates `%ProgramData%\\UnifiedMcp\\filesystem-roots.json` if absent, and installs `UnifiedMcpBackend` followed by `UnifiedMcpNginx`. Pass the Cloudflare Access team domain and the Access application's Audience (AUD) tag to enable origin validation for HTTP MCP/REST requests. The default filesystem config exposes the installing user's `code` directory as a writable root named `code`; edit that file to narrow or expand agent access. To remove only the services while retaining configuration, certificates, secrets, and logs:
+The installer:
+
+- builds the Node backend,
+- binds it to `127.0.0.1:18766`,
+- configures Cloudflare Access JWT validation,
+- enables the safe direct-loopback diagnostic bypass,
+- creates the filesystem roots config if needed,
+- removes the legacy `UnifiedMcpNginx` Windows service if it exists,
+- installs/restarts `UnifiedMcpBackend`.
+
+The resulting local endpoints are:
+
+```text
+http://127.0.0.1:18766/mcp
+ws://127.0.0.1:18766/bridge
+http://127.0.0.1:18766/health
+```
+
+The public endpoints are:
+
+```text
+https://unified-mcp.pentestsystem.com/mcp
+wss://unified-mcp.pentestsystem.com/bridge
+https://unified-mcp.pentestsystem.com/health
+```
+
+To remove the Windows service while retaining configuration and logs:
 
 ```powershell
 .\deploy\windows\uninstall.ps1
 ```
 
-## Configure each Chrome client
+Older installs may still contain certificate or PSK files under `C:\ProgramData\UnifiedMcp`. They are not used by the new transport.
 
-1. Open `chrome://extensions`, enable Developer mode, and load `extension/` unpacked.
-2. Open the extension details and choose **Extension options**.
-3. Set a unique stable Browser ID and useful name.
-4. Set the endpoint, such as `wss://localhost:9443/bridge`.
-5. Copy the PSK from the server as an Administrator, enter it in the options, and save.
+## Chrome extension
 
-For remote browser machines use a DNS name or IP covered by the certificate. The popup reports connection state without displaying the PSK.
+Load `extension/` unpacked from `chrome://extensions`.
 
-## MCP configuration
-
-The Streamable HTTP endpoint is `https://localhost:9443/mcp`. The Chrome bridge and HTTP MCP endpoint use separate authentication paths:
+The default bridge URL is:
 
 ```text
-/bridge -> 127.0.0.1:18765 -> Chrome PSK authentication
-/mcp    -> 127.0.0.1:18766 -> Cloudflare Access Managed OAuth + origin JWT validation
-/v1/*   -> 127.0.0.1:18766 -> Cloudflare Access JWT validation when exposed
+wss://unified-mcp.pentestsystem.com/bridge
 ```
 
-For the Cloudflare MCP Portal deployment:
+The extension no longer stores or transmits a PSK.
 
-1. Keep the tunnel route for `unified-mcp.pentestsystem.com` pointed at the local nginx listener on port 9443.
-2. Create a Cloudflare Access self-hosted/MCP application for `unified-mcp.pentestsystem.com/mcp*`. Do **not** include `/bridge` in that Access application.
-3. Enable **Managed OAuth** on that Access application.
-4. Allow the portal's upstream OAuth callback, normally `https://mcp.pentestsystem.com/servers-callback` (or Cloudflare's shared callback if you explicitly enabled it).
-5. Copy the Access application's Audience (AUD) tag and configure the Windows service with `-CloudflareAccessTeamDomain` and `-CloudflareAccessAudience`.
-6. Add `https://unified-mcp.pentestsystem.com/mcp` to the Cloudflare MCP Portal as an **OAuth** upstream server.
+Open **Extension options** and:
 
-Cloudflare Access handles the OAuth discovery, DCR/authorization flow, token issuance, refresh, and policy enforcement at the edge. After a successful request reaches the origin, Access includes the user's signed identity JWT in `Cf-Access-Jwt-Assertion`. Unified MCP verifies that JWT's signature, issuer, audience, and expiration against the Access team's signing keys before processing MCP or REST requests. The Chrome PSK is not accepted as an HTTP credential while Cloudflare Access validation is configured.
+1. Confirm the bridge WebSocket URL.
+2. Set a stable Browser ID and useful name.
+3. Select **Sign in with Cloudflare Access**.
+4. Complete the Access login in the opened browser tab.
+5. Save and reconnect.
 
-The backend discovers and forwards VibeTerm's project and terminal tools from `http://127.0.0.1:47821/mcp`, so clients need only this one endpoint. `chrome_browsers_list` lists available IDs. When exactly one browser is connected, `browserId` may be omitted; with multiple browsers it is required.
+The sign-in tab visits the protected Unified MCP hostname so Cloudflare can issue the application authorization cookie. If a browser blocks the Access cookie as a third-party cookie, allow cookies for the Unified MCP hostname and the Cloudflare Access team domain.
 
-Run `deploy/windows/configure-codex-env.ps1` after installation. It shares the gateway PSK with VibeTerm, trusts the TLS certificate in Windows and WSL, and maps `unified-mcp.local` to WSL's current Windows-host gateway. VibeTerm refreshes that WSL route whenever it starts its Codex app server.
+## MCP clients
 
-```http
-POST /mcp HTTP/1.1
-Host: localhost:9443
-Cf-Access-Jwt-Assertion: <ACCESS_JWT>
-Content-Type: application/json
+The MCP Streamable HTTP URL is:
 
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"chrome_tabs_list","arguments":{"browserId":"work-laptop"}}}
+```text
+https://unified-mcp.pentestsystem.com/mcp
 ```
+
+Enable **Managed OAuth** on the Access application and let compatible MCP clients perform their normal OAuth flow.
+
+Unified MCP does not require a separate application password, PSK, or locally issued OAuth token.
 
 The existing stdio MCP interface remains available for local compatibility:
 
@@ -121,18 +184,46 @@ The existing stdio MCP interface remains available for local compatibility:
   "mcpServers": {
     "unified-local": {
       "command": "node",
-      "args": ["C:/path/to/chrome-cdp-bridge/server/dist/index.js"]
+      "args": ["C:/Users/rober/code/unified-mcp/server/dist/index.js"]
     }
   }
 }
 ```
 
-## Filesystem tools
+## Browser tools
 
-The gateway can expose selected local directories to MCP agents through named roots. Filesystem access is disabled until a valid roots configuration exists. The Windows service installer creates:
+Unified MCP currently exposes Chrome tools including:
 
 ```text
-%ProgramData%\UnifiedMcp\filesystem-roots.json
+chrome_browsers_list
+chrome_status
+chrome_tabs_list
+chrome_tab_open
+chrome_tab_activate
+chrome_tab_close
+chrome_page_info
+chrome_page_text
+chrome_page_click
+chrome_page_type
+chrome_page_script
+chrome_cdp_targets
+chrome_cdp_protocol
+chrome_cdp_attached
+chrome_cdp_attach
+chrome_cdp_detach
+chrome_cdp_send
+chrome_cdp_call
+chrome_cdp_events
+```
+
+Every browser connection registers a stable `browserId`. When exactly one browser is connected it may be omitted from tool calls; when multiple browsers are online it is required.
+
+## Filesystem tools
+
+Filesystem roots are configured in:
+
+```text
+C:\ProgramData\UnifiedMcp\filesystem-roots.json
 ```
 
 Example:
@@ -152,18 +243,66 @@ Example:
 }
 ```
 
-Available tools are `fs_roots_list`, `fs_list`, `fs_stat`, `fs_read_text`, `fs_write_text`, `fs_replace_text`, `fs_mkdir`, and `fs_move`. Agents address files using a root name plus a relative path; absolute paths, UNC paths, parent traversal, and resolved symlink/junction escapes are rejected. Reads and writes default to a 4 MiB maximum file size, directory listings are capped at 1,000 entries, writes can use an `expectedSha256` guard to prevent lost updates, and modifying operations are appended to `%ProgramData%\\UnifiedMcp\\logs\\filesystem-audit.log`.
+Available tools are:
 
-`fs_replace_text` performs exact-match replacement and can require an expected occurrence count, which is safer for agent-driven edits than line-number based patches. Deletion is intentionally not exposed.
+```text
+fs_roots_list
+fs_list
+fs_stat
+fs_read_text
+fs_write_text
+fs_replace_text
+fs_mkdir
+fs_move
+```
 
-## REST and health
+Absolute paths, UNC paths, parent traversal, and resolved junction/symlink escapes are rejected. Writes can use an expected SHA-256 guard and modifying operations are audit logged.
 
-Open `https://localhost:9443/` for a live dashboard of connected browser clients, heartbeat times, and bridge metrics.
+## VibeTerm upstream
 
-`GET /health` is intentionally unauthenticated and returns service/browser connection metadata. When Cloudflare Access validation is configured, `/mcp`, `/v1/*`, and `/openapi.json` require a valid `Cf-Access-Jwt-Assertion` from the configured Access application. Select a browser using `X-Browser-Id`, `?browserId=...`, or `browserId` in a JSON body.
+VibeTerm remains an optional internal MCP upstream at:
 
-The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN`, `UNIFIED_MCP_CF_ACCESS_AUD`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
+```text
+http://127.0.0.1:47821/mcp
+```
 
-## Add more unified tools
+Its authentication is independent from Unified MCP transport authentication. If VibeTerm requires a token, set `VIBETERM_API_TOKEN`; Unified MCP no longer reuses a browser or gateway PSK as the VibeTerm credential.
 
-Add local tool definitions to `localMcpTools` and dispatch them from `mcpCall` in `server/src/index.ts`. Additional Streamable HTTP tool families can use the upstream adapter in `server/src/mcp-upstream.ts`.
+## Development modes
+
+For an explicitly unauthenticated loopback development process:
+
+```powershell
+.\deploy\windows\start-no-auth.ps1
+```
+
+For a user-scoped process that validates Cloudflare Access:
+
+```powershell
+.\deploy\windows\start-authenticated.ps1 `
+  -CloudflareAccessTeamDomain "https://bitter-surf-66e7.cloudflareaccess.com" `
+  -CloudflareAccessAudience "<ACCESS_APP_AUD_TAG>"
+```
+
+Never publish `-AllowNoAuth` through a Tunnel.
+
+## Relevant environment variables
+
+```text
+UNIFIED_MCP_PORT
+UNIFIED_MCP_BIND_HOST
+UNIFIED_MCP_ALLOW_NO_AUTH
+UNIFIED_MCP_ALLOW_LOOPBACK_NO_AUTH
+UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN
+UNIFIED_MCP_CF_ACCESS_AUD
+UNIFIED_MCP_CF_ACCESS_CERTS_URL
+UNIFIED_MCP_FS_CONFIG
+UNIFIED_MCP_FS_MAX_FILE_BYTES
+UNIFIED_MCP_FS_AUDIT_LOG
+VIBETERM_MCP_URL
+VIBETERM_API_TOKEN
+VIBETERM_MCP_TIMEOUT_MS
+VIBETERM_MCP_DISABLED
+```
+
+`CHROME_API_PORT` and `CHROME_BIND_HOST` remain accepted as compatibility fallbacks, but new deployments should use the `UNIFIED_MCP_*` names.
