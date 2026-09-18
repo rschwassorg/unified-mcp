@@ -8,6 +8,7 @@ import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { HttpMcpUpstream } from "./mcp-upstream.js";
 import { filesystemCall, filesystemTools, ownsFilesystemTool } from "./filesystem.js";
+import { UnifiedMcpOAuthServer } from "./oauth.js";
 
 const require = createRequire(import.meta.url);
 const BRIDGE_PORT = Number(process.env.CHROME_MCP_PORT ?? 18765);
@@ -19,6 +20,10 @@ const REQUEST_TIMEOUT_MS = Number(process.env.CHROME_MCP_TIMEOUT_MS ?? 15000);
 const DEBUG_LOG = process.env.CHROME_MCP_DEBUG_LOG || join(process.cwd(), "chrome-mcp-debug.log");
 const PUBLIC_DIR = join(process.cwd(), "public");
 const VIBETERM_MCP_URL = process.env.VIBETERM_MCP_URL ?? "http://127.0.0.1:47821/mcp";
+const OAUTH_ISSUER = (process.env.UNIFIED_MCP_OAUTH_ISSUER || "").replace(/\\\/+$/, "");
+const OAUTH_STATE_FILE = process.env.UNIFIED_MCP_OAUTH_STATE_FILE || join(process.cwd(), "oauth-state.json");
+const OAUTH_ALLOWED_REDIRECT_HOSTS = (process.env.UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS || "")
+  .split(",").map((value) => value.trim()).filter(Boolean);
 
 type ChromeRequest = { type: "request"; id: string; method: string; params?: Record<string, unknown> };
 type ChromeResponse = { type: "response"; id: string; ok: boolean; result?: unknown; error?: string };
@@ -34,6 +39,13 @@ const cdpProtocol: ProtocolDefinition = { version: browserProtocol.version, doma
 const PSK = process.env.UNIFIED_MCP_PSK || (process.env.UNIFIED_MCP_PSK_FILE ? readFileSync(process.env.UNIFIED_MCP_PSK_FILE, "utf8").trim() : "");
 const ALLOW_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_NO_AUTH === "true";
 const ALLOW_LOOPBACK_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_LOOPBACK_NO_AUTH === "true";
+const oauthServer = OAUTH_ISSUER ? new UnifiedMcpOAuthServer({
+  issuer: OAUTH_ISSUER,
+  resource: `${OAUTH_ISSUER}/mcp`,
+  stateFile: OAUTH_STATE_FILE,
+  approvalSecret: process.env.UNIFIED_MCP_OAUTH_APPROVAL_SECRET || PSK,
+  allowedRedirectHosts: OAUTH_ALLOWED_REDIRECT_HOSTS,
+}) : undefined;
 type BrowserConnection = { id: string; name: string; socket: WebSocket; connectedAt: string; lastSeenAt: string };
 const pending = new Map<string, { browserId: string; resolve: (value: unknown) => void; reject: (reason: Error) => void; timeout: NodeJS.Timeout }>();
 const browsers = new Map<string, BrowserConnection>();
@@ -185,6 +197,7 @@ async function unifiedMcpTools() {
 async function handleHttp(request: IncomingMessage, response: ServerResponse) {
   const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
   try {
+    if (oauthServer && await oauthServer.handlePublicEndpoint(request, response, url)) return;
     if (request.method === "GET" && ["/", "/app.js", "/styles.css"].includes(url.pathname)) return sendDashboardAsset(response, url.pathname);
     if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, serverStatus());
     if (request.method === "GET" && url.pathname === "/openapi.json") { authorize(request); return sendJson(response, 200, openApi()); }
@@ -205,7 +218,8 @@ async function handleHttp(request: IncomingMessage, response: ServerResponse) {
     return sendJson(response, 200, result);
   } catch (error) {
     const status = error instanceof HttpError ? error.status : 500;
-    sendJson(response, status, { error: errorMessage(error) });
+    const headers = error instanceof HttpError ? error.headers : {};
+    sendJson(response, status, { error: errorMessage(error) }, headers);
   }
 }
 
@@ -306,7 +320,7 @@ function mcpTool(name: string, description: string, properties: Record<string, u
 function mcpText(value: unknown) { return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] }; }
 function respondMcp(id: string | number, result: unknown) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`); }
 function respondMcpError(id: string | number, message: string) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`); }
-function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], apiPort: API_PORT, bridgePort: BRIDGE_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : ALLOW_LOOPBACK_NO_AUTH ? "psk-with-loopback-bypass" : "psk" }; }
+function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], apiPort: API_PORT, bridgePort: BRIDGE_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : oauthServer ? "oauth+psk" : ALLOW_LOOPBACK_NO_AUTH ? "psk-with-loopback-bypass" : "psk", oauthIssuer: oauthServer?.issuer }; }
 function registerBrowser(socket: WebSocket, id: string, name: string) {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(id)) return socket.close(1008, "Invalid browserId");
   const previous = browsers.get(id);
@@ -326,9 +340,15 @@ function selectBrowser(value: unknown) {
 function authorize(request: IncomingMessage) {
   if (ALLOW_NO_AUTH) return;
   if (ALLOW_LOOPBACK_NO_AUTH && isDirectLoopbackRequest(request)) return;
-  if (!PSK) throw new HttpError(503, "UNIFIED_MCP_PSK is not configured");
   const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!safeEqual(supplied, PSK)) throw new HttpError(401, "Unauthorized");
+  if (PSK && safeEqual(supplied, PSK)) return;
+  if (oauthServer?.isAccessToken(supplied)) return;
+  if (!PSK && !oauthServer) throw new HttpError(503, "Unified MCP authentication is not configured");
+  throw new HttpError(
+    401,
+    "Unauthorized",
+    oauthServer ? { "WWW-Authenticate": oauthServer.challengeHeader } : {},
+  );
 }
 function isDirectLoopbackRequest(request: IncomingMessage) {
   const remoteAddress = request.socket.remoteAddress || "";
@@ -344,7 +364,7 @@ function safeEqual(left: string, right: string) {
   const a = Buffer.from(left); const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
 }
-function sendJson(response: ServerResponse, status: number, value: unknown) { response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" }).end(JSON.stringify(value)); }
+function sendJson(response: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}) { response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...headers }).end(JSON.stringify(value)); }
 function sendDashboardAsset(response: ServerResponse, path: string) {
   const asset = path === "/" ? "index.html" : path.slice(1);
   const contentType = asset.endsWith(".html") ? "text/html; charset=utf-8" : asset.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8";
@@ -356,7 +376,7 @@ function sendDashboardAsset(response: ServerResponse, path: string) {
 }
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : String(error); }
 function debug(event: string, data: Record<string, unknown>) { try { appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${event} ${JSON.stringify(data)}\n`); } catch { /* logging must not break the bridge */ } }
-class HttpError extends Error { constructor(readonly status: number, message: string) { super(message); } }
+class HttpError extends Error { constructor(readonly status: number, message: string, readonly headers: Record<string, string> = {}) { super(message); } }
 
 function shutdown() {
   if (shuttingDown) return;
