@@ -24,6 +24,8 @@ const OAUTH_ISSUER = (process.env.UNIFIED_MCP_OAUTH_ISSUER || "").replace(/\/+$/
 const OAUTH_STATE_FILE = process.env.UNIFIED_MCP_OAUTH_STATE_FILE || join(process.cwd(), "oauth-state.json");
 const OAUTH_ALLOWED_REDIRECT_HOSTS = (process.env.UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS || "")
   .split(",").map((value) => value.trim()).filter(Boolean);
+const OAUTH_CF_ACCESS_TEAM_DOMAIN = process.env.UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN || "";
+const OAUTH_CF_ACCESS_AUD = process.env.UNIFIED_MCP_OAUTH_CF_ACCESS_AUD || "";
 
 type ChromeRequest = { type: "request"; id: string; method: string; params?: Record<string, unknown> };
 type ChromeResponse = { type: "response"; id: string; ok: boolean; result?: unknown; error?: string };
@@ -44,6 +46,8 @@ const oauthServer = OAUTH_ISSUER ? new UnifiedMcpOAuthServer({
   resource: `${OAUTH_ISSUER}/mcp`,
   stateFile: OAUTH_STATE_FILE,
   allowedRedirectHosts: OAUTH_ALLOWED_REDIRECT_HOSTS,
+  cloudflareAccessTeamDomain: OAUTH_CF_ACCESS_TEAM_DOMAIN,
+  cloudflareAccessAudience: OAUTH_CF_ACCESS_AUD,
 }) : undefined;
 type BrowserConnection = { id: string; name: string; socket: WebSocket; connectedAt: string; lastSeenAt: string };
 const pending = new Map<string, { browserId: string; resolve: (value: unknown) => void; reject: (reason: Error) => void; timeout: NodeJS.Timeout }>();
