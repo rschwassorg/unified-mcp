@@ -5,10 +5,8 @@ param(
   [string] $NodeExe = (Get-Command node -ErrorAction Stop).Source,
   [string] $OpenSslExe = (Get-Command openssl -ErrorAction Stop).Source,
   [string] $PublicHost = "localhost",
-  [string] $OAuthIssuer = "",
-  [string] $OAuthAllowedRedirectHosts = "",
-  [string] $OAuthCloudflareAccessTeamDomain = "",
-  [string] $OAuthCloudflareAccessAudience = "",
+  [string] $CloudflareAccessTeamDomain = "",
+  [string] $CloudflareAccessAudience = "",
   [switch] $AllowNoAuth
 )
 
@@ -22,11 +20,9 @@ $serviceRoot = Join-Path $env:ProgramData "UnifiedMcp"
 $secretRoot = Join-Path $serviceRoot "secrets"
 $certRoot = Join-Path $serviceRoot "certs"
 $logRoot = Join-Path $serviceRoot "logs"
-$oauthRoot = Join-Path $serviceRoot "oauth"
-$oauthStatePath = Join-Path $oauthRoot "state.json"
 $filesystemConfigPath = Join-Path $serviceRoot "filesystem-roots.json"
 
-New-Item -ItemType Directory -Force -Path $serviceRoot,$secretRoot,$certRoot,$logRoot,$oauthRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $serviceRoot,$secretRoot,$certRoot,$logRoot | Out-Null
 if (-not (Test-Path -LiteralPath $filesystemConfigPath)) {
   $defaultCodeRoot = Join-Path $env:USERPROFILE "code"
   $filesystemConfig = @{ roots = @{ code = @{ path = $defaultCodeRoot; readOnly = $false } } } | ConvertTo-Json -Depth 5
@@ -63,30 +59,24 @@ $escapedProject = [Security.SecurityElement]::Escape($projectRoot)
 $escapedNode = [Security.SecurityElement]::Escape($nodePath)
 $escapedPsk = [Security.SecurityElement]::Escape($pskPath)
 $escapedFilesystemConfig = [Security.SecurityElement]::Escape($filesystemConfigPath)
-$escapedOAuthState = [Security.SecurityElement]::Escape($oauthStatePath)
 $escapedNginx = [Security.SecurityElement]::Escape((Join-Path $nginxRootPath "nginx.exe"))
 $nginxPrefix = $nginxRootPath.Replace("\", "/") + "/"
 $noAuthEnvironment = if ($AllowNoAuth) { '<env name="UNIFIED_MCP_ALLOW_NO_AUTH" value="true"/>' } else { '' }
-$oauthEnvironment = ''
-if ($OAuthIssuer) {
-  $normalizedIssuer = $OAuthIssuer.TrimEnd('/')
-  if ($normalizedIssuer -notmatch '^https://') {
-    throw "OAuthIssuer must use https:// for the Windows service installation"
+$accessEnvironment = ''
+if ($CloudflareAccessTeamDomain -or $CloudflareAccessAudience) {
+  if (-not $CloudflareAccessTeamDomain -or -not $CloudflareAccessAudience) {
+    throw "CloudflareAccessTeamDomain and CloudflareAccessAudience must be configured together"
   }
-  if (-not $OAuthAllowedRedirectHosts) {
-    throw "OAuthAllowedRedirectHosts is required when OAuthIssuer is configured"
+  $normalizedAccessTeam = $CloudflareAccessTeamDomain.TrimEnd('/')
+  if ($normalizedAccessTeam -notmatch '^https://[^/]+\.cloudflareaccess\.com$') {
+    throw "CloudflareAccessTeamDomain must be an https://*.cloudflareaccess.com origin"
   }
-  if (-not $OAuthCloudflareAccessTeamDomain -or -not $OAuthCloudflareAccessAudience) {
-    throw "OAuthCloudflareAccessTeamDomain and OAuthCloudflareAccessAudience are required for production OAuth authorization"
-  }
-  $escapedOAuthIssuer = [Security.SecurityElement]::Escape($normalizedIssuer)
-  $escapedOAuthRedirectHosts = [Security.SecurityElement]::Escape($OAuthAllowedRedirectHosts)
-  $escapedOAuthAccessTeam = [Security.SecurityElement]::Escape($OAuthCloudflareAccessTeamDomain.TrimEnd('/'))
-  $escapedOAuthAccessAud = [Security.SecurityElement]::Escape($OAuthCloudflareAccessAudience)
-  $oauthEnvironment = '<env name="UNIFIED_MCP_OAUTH_ISSUER" value="' + $escapedOAuthIssuer + '"/><env name="UNIFIED_MCP_OAUTH_STATE_FILE" value="' + $escapedOAuthState + '"/><env name="UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS" value="' + $escapedOAuthRedirectHosts + '"/><env name="UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN" value="' + $escapedOAuthAccessTeam + '"/><env name="UNIFIED_MCP_OAUTH_CF_ACCESS_AUD" value="' + $escapedOAuthAccessAud + '"/>'
+  $escapedAccessTeam = [Security.SecurityElement]::Escape($normalizedAccessTeam)
+  $escapedAccessAud = [Security.SecurityElement]::Escape($CloudflareAccessAudience)
+  $accessEnvironment = '<env name="UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN" value="' + $escapedAccessTeam + '"/><env name="UNIFIED_MCP_CF_ACCESS_AUD" value="' + $escapedAccessAud + '"/>'
 }
 $backendXml = @"
-<service><id>UnifiedMcpBackend</id><name>Unified MCP Backend</name><description>Unified MCP and multi-client Chrome CDP backend.</description><executable>$escapedNode</executable><arguments>&quot;$escapedProject\server\dist\index.js&quot;</arguments><workingdirectory>$escapedProject\server</workingdirectory><env name="CHROME_BIND_HOST" value="127.0.0.1"/><env name="UNIFIED_MCP_PSK_FILE" value="$escapedPsk"/><env name="UNIFIED_MCP_FS_CONFIG" value="$escapedFilesystemConfig"/>$oauthEnvironment$noAuthEnvironment<env name="UNIFIED_MCP_KEEP_ALIVE" value="1"/><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><onfailure action="restart" delay="5 sec"/></service>
+<service><id>UnifiedMcpBackend</id><name>Unified MCP Backend</name><description>Unified MCP and multi-client Chrome CDP backend.</description><executable>$escapedNode</executable><arguments>&quot;$escapedProject\server\dist\index.js&quot;</arguments><workingdirectory>$escapedProject\server</workingdirectory><env name="CHROME_BIND_HOST" value="127.0.0.1"/><env name="UNIFIED_MCP_PSK_FILE" value="$escapedPsk"/><env name="UNIFIED_MCP_FS_CONFIG" value="$escapedFilesystemConfig"/>$accessEnvironment$noAuthEnvironment<env name="UNIFIED_MCP_KEEP_ALIVE" value="1"/><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><onfailure action="restart" delay="5 sec"/></service>
 "@
 $nginxXml = @"
 <service><id>UnifiedMcpNginx</id><name>Unified MCP nginx</name><description>TLS reverse proxy for Unified MCP.</description><executable>$escapedNginx</executable><arguments>-p &quot;$nginxPrefix&quot; -c conf/unified-mcp.conf</arguments><stopexecutable>$escapedNginx</stopexecutable><stoparguments>-p &quot;$nginxPrefix&quot; -s stop</stoparguments><workingdirectory>$nginxRootPath</workingdirectory><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><depend>UnifiedMcpBackend</depend><onfailure action="restart" delay="5 sec"/></service>
@@ -107,8 +97,6 @@ foreach ($service in @(@{Name="UnifiedMcpBackend"; Xml=$backendXml}, @{Name="Uni
 Write-Host "Phase: ACL hardening"
 & icacls.exe $secretRoot /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Failed to restrict PSK directory permissions" }
-& icacls.exe $oauthRoot /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Failed to restrict OAuth state directory permissions" }
 
 Write-Host "Unified MCP installed at https://$PublicHost`:9443/mcp"
 Write-Host "Import $certPath into Trusted Root Certification Authorities on each browser machine."
@@ -118,9 +106,7 @@ if ($AllowNoAuth) {
 } else {
   Write-Host "The Chrome bridge PSK is stored at $pskPath and was intentionally not printed."
 }
-if ($OAuthIssuer) {
-  Write-Host "HTTP MCP OAuth issuer: $($OAuthIssuer.TrimEnd('/'))"
-  Write-Host "OAuth state: $oauthStatePath"
-  Write-Host "OAuth redirect hosts: $OAuthAllowedRedirectHosts"
-  Write-Host "OAuth authorization is gated by Cloudflare Access team: $($OAuthCloudflareAccessTeamDomain.TrimEnd('/'))"
+if ($CloudflareAccessTeamDomain) {
+  Write-Host "HTTP MCP authentication: Cloudflare Access Managed OAuth"
+  Write-Host "Cloudflare Access team: $($CloudflareAccessTeamDomain.TrimEnd('/'))"
 }
