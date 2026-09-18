@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 
 const apiPort = 28772;
-const bridgePort = 28771;
 const upstreamPort = 28773;
 const token = "test-shared-token";
 
@@ -24,9 +23,8 @@ const backend = spawn(process.execPath, ["dist/index.js"], {
   cwd: new URL("..", import.meta.url),
   env: {
     ...process.env,
-    CHROME_API_PORT: String(apiPort),
-    CHROME_MCP_PORT: String(bridgePort),
-    UNIFIED_MCP_PSK: token,
+    UNIFIED_MCP_PORT: String(apiPort),
+    UNIFIED_MCP_ALLOW_NO_AUTH: "true",
     VIBETERM_API_TOKEN: token,
     UNIFIED_MCP_KEEP_ALIVE: "1",
     VIBETERM_MCP_URL: `http://127.0.0.1:${upstreamPort}/mcp`
@@ -39,6 +37,7 @@ try {
     try { return (await fetch(`http://127.0.0.1:${apiPort}/health`)).ok; }
     catch { return false; }
   });
+
   const listed = await rpc("tools/list", {});
   assert.ok(listed.tools.some((tool) => tool.name === "chrome_status"));
   assert.ok(listed.tools.some((tool) => tool.name === "terminal_echo"));
@@ -49,6 +48,7 @@ try {
   const health = await (await fetch(`http://127.0.0.1:${apiPort}/health`)).json();
   assert.equal(health.upstreams[0].connected, true);
   assert.equal(health.upstreams[0].toolCount, 1);
+
   process.stdout.write("VibeTerm upstream integration test passed\n");
 } finally {
   backend.kill();
