@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [int] $Port = 18768,
+  [int] $Port = 18766,
   [string] $CloudflareAccessTeamDomain = $env:UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN,
   [string] $CloudflareAccessAudience = $env:UNIFIED_MCP_CF_ACCESS_AUD
 )

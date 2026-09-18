@@ -78,18 +78,23 @@ unified-mcp -> <TUNNEL-UUID>.cfargotunnel.com
 
 ### 2. Cloudflare Access
 
-Create an Access application covering the Unified MCP hostname, not only `/mcp`:
+Create a **Self-hosted and private** Access application with a **public hostname** covering the entire Unified MCP hostname, not only `/mcp`:
 
 ```text
 unified-mcp.pentestsystem.com
 ```
 
+Do **not** create an RDP, browser-rendered RDP, or Infrastructure Access application for Unified MCP. Unified MCP is an HTTP/WebSocket service. A policy containing RDP connection rules such as `connection_rules.rdp` belongs to an RDP connection context and is the wrong policy shape for this service.
+
 Recommended settings:
 
+- Application type: **Self-hosted and private** -> **Add public hostname**.
 - Allow policy restricted to the intended user identity.
+- If the policy uses **Cloudflare Account Member**, select the **Cloudflare** identity provider for the application; that selector requires the Cloudflare identity provider.
 - **Managed OAuth: enabled** so MCP/CLI clients can authenticate.
 - Application cookie **SameSite: None** for cross-origin browser-extension WebSocket connections.
 - Keep the application Audience (AUD) tag; the Windows service uses it to validate Access JWTs.
+- After replacing an Access application, update `UNIFIED_MCP_CF_ACCESS_AUD` / `-CloudflareAccessAudience` to the new application's AUD before restarting the backend.
 
 The origin does not implement its own OAuth authorization server. Cloudflare Access owns the OAuth flow.
 
