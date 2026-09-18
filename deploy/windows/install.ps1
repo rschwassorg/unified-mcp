@@ -7,6 +7,8 @@ param(
   [string] $PublicHost = "localhost",
   [string] $OAuthIssuer = "",
   [string] $OAuthAllowedRedirectHosts = "",
+  [string] $OAuthCloudflareAccessTeamDomain = "",
+  [string] $OAuthCloudflareAccessAudience = "",
   [switch] $AllowNoAuth
 )
 
@@ -74,9 +76,14 @@ if ($OAuthIssuer) {
   if (-not $OAuthAllowedRedirectHosts) {
     throw "OAuthAllowedRedirectHosts is required when OAuthIssuer is configured"
   }
+  if (-not $OAuthCloudflareAccessTeamDomain -or -not $OAuthCloudflareAccessAudience) {
+    throw "OAuthCloudflareAccessTeamDomain and OAuthCloudflareAccessAudience are required for production OAuth authorization"
+  }
   $escapedOAuthIssuer = [Security.SecurityElement]::Escape($normalizedIssuer)
   $escapedOAuthRedirectHosts = [Security.SecurityElement]::Escape($OAuthAllowedRedirectHosts)
-  $oauthEnvironment = '<env name="UNIFIED_MCP_OAUTH_ISSUER" value="' + $escapedOAuthIssuer + '"/><env name="UNIFIED_MCP_OAUTH_STATE_FILE" value="' + $escapedOAuthState + '"/><env name="UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS" value="' + $escapedOAuthRedirectHosts + '"/>'
+  $escapedOAuthAccessTeam = [Security.SecurityElement]::Escape($OAuthCloudflareAccessTeamDomain.TrimEnd('/'))
+  $escapedOAuthAccessAud = [Security.SecurityElement]::Escape($OAuthCloudflareAccessAudience)
+  $oauthEnvironment = '<env name="UNIFIED_MCP_OAUTH_ISSUER" value="' + $escapedOAuthIssuer + '"/><env name="UNIFIED_MCP_OAUTH_STATE_FILE" value="' + $escapedOAuthState + '"/><env name="UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS" value="' + $escapedOAuthRedirectHosts + '"/><env name="UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN" value="' + $escapedOAuthAccessTeam + '"/><env name="UNIFIED_MCP_OAUTH_CF_ACCESS_AUD" value="' + $escapedOAuthAccessAud + '"/>'
 }
 $backendXml = @"
 <service><id>UnifiedMcpBackend</id><name>Unified MCP Backend</name><description>Unified MCP and multi-client Chrome CDP backend.</description><executable>$escapedNode</executable><arguments>&quot;$escapedProject\server\dist\index.js&quot;</arguments><workingdirectory>$escapedProject\server</workingdirectory><env name="CHROME_BIND_HOST" value="127.0.0.1"/><env name="UNIFIED_MCP_PSK_FILE" value="$escapedPsk"/><env name="UNIFIED_MCP_FS_CONFIG" value="$escapedFilesystemConfig"/>$oauthEnvironment$noAuthEnvironment<env name="UNIFIED_MCP_KEEP_ALIVE" value="1"/><logpath>$logRoot</logpath><log mode="roll"/><startmode>Automatic</startmode><onfailure action="restart" delay="5 sec"/></service>
@@ -115,4 +122,5 @@ if ($OAuthIssuer) {
   Write-Host "HTTP MCP OAuth issuer: $($OAuthIssuer.TrimEnd('/'))"
   Write-Host "OAuth state: $oauthStatePath"
   Write-Host "OAuth redirect hosts: $OAuthAllowedRedirectHosts"
+  Write-Host "OAuth authorization is gated by Cloudflare Access team: $($OAuthCloudflareAccessTeamDomain.TrimEnd('/'))"
 }
