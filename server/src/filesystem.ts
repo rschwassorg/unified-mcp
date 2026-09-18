@@ -272,7 +272,7 @@ async function loadRoots(): Promise<Map<string, FilesystemRoot>> {
   let parsed: FilesystemConfig;
   try {
     const raw = await readFile(configPath, "utf8");
-    parsed = JSON.parse(raw.replace(/^\\uFEFF/, "")) as FilesystemConfig;
+    parsed = JSON.parse(raw.replace(/^\uFEFF/, "")) as FilesystemConfig;
   } catch (error) {
     throw new Error(`Unable to read filesystem configuration at ${configPath}: ${errorMessage(error)}`);
   }
