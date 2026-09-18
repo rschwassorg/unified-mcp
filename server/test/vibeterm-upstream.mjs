@@ -58,7 +58,7 @@ try {
 async function rpc(method, params) {
   const response = await fetch(`http://127.0.0.1:${apiPort}/mcp`, {
     method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
   });
   assert.equal(response.status, 200);
