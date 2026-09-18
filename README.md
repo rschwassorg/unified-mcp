@@ -14,13 +14,13 @@ nginx terminates TLS but does not execute MCP logic. On Windows, nginx and the N
 ## Security model
 
 - TLS is required on the exposed listener.
-- Browsers authenticate in their first WSS message with a pre-shared key.
-- MCP and REST clients use `Authorization: Bearer <OAUTH_ACCESS_TOKEN>`.
-- The Windows installer generates a 256-bit PSK under `%ProgramData%\UnifiedMcp\secrets`, accessible only to SYSTEM and Administrators.
+- Browsers authenticate in their first WSS message with a pre-shared key. The Chrome bridge keeps this PSK on `/bridge`.
+- HTTP MCP/REST requests can be protected by Cloudflare Access Managed OAuth. The origin validates the `Cf-Access-Jwt-Assertion` JWT from Access and does not use the Chrome PSK for HTTP when Access validation is configured.
+- The Windows installer generates a 256-bit Chrome PSK under `%ProgramData%\UnifiedMcp\secrets`, accessible only to SYSTEM and Administrators.
 - The PSK is never written into nginx configuration, service XML, logs, or source control.
 - The included certificate is self-signed. Import its public `.crt` into Trusted Root Certification Authorities on every client machine. Replace it with a trusted certificate before wider use.
 
-Anyone holding the Chrome PSK can connect a browser bridge client. OAuth access tokens control HTTP MCP/REST access when OAuth is enabled. Expose only the minimum required filesystem roots and keep the public MCP endpoint behind the intended reverse proxy/tunnel.
+Anyone holding the Chrome PSK can connect a browser bridge client. HTTP MCP/REST access is controlled independently by Cloudflare Access when configured. Expose only the minimum required filesystem roots and keep the public MCP endpoint behind the intended Cloudflare Tunnel and Access policy.
 
 ### Temporary local no-auth mode
 
@@ -59,10 +59,12 @@ cd C:\path\to\chrome-cdp-bridge
 .\deploy\windows\install.ps1 `
   -NginxRoot C:\tools\nginx `
   -WinSWExe C:\tools\WinSW-x64.exe `
-  -PublicHost localhost
+  -PublicHost localhost `
+  -CloudflareAccessTeamDomain "https://bitter-surf-66e7.cloudflareaccess.com" `
+  -CloudflareAccessAudience "<ACCESS_APP_AUD_TAG>"
 ```
 
-The installer builds the backend, creates the PSK and certificate if absent, validates nginx, creates `%ProgramData%\\UnifiedMcp\\filesystem-roots.json` if absent, and installs `UnifiedMcpBackend` followed by `UnifiedMcpNginx`. The default filesystem config exposes the installing user's `code` directory as a writable root named `code`; edit that file to narrow or expand agent access. It does not print the PSK. To remove only the services while retaining configuration, certificates, secrets, and logs:
+The installer builds the backend, creates the Chrome PSK and certificate if absent, validates nginx, creates `%ProgramData%\\UnifiedMcp\\filesystem-roots.json` if absent, and installs `UnifiedMcpBackend` followed by `UnifiedMcpNginx`. Pass the Cloudflare Access team domain and the Access application's Audience (AUD) tag to enable origin validation for HTTP MCP/REST requests. The default filesystem config exposes the installing user's `code` directory as a writable root named `code`; edit that file to narrow or expand agent access. To remove only the services while retaining configuration, certificates, secrets, and logs:
 
 ```powershell
 .\deploy\windows\uninstall.ps1
@@ -84,15 +86,20 @@ The Streamable HTTP endpoint is `https://localhost:9443/mcp`. The Chrome bridge 
 
 ```text
 /bridge -> 127.0.0.1:18765 -> Chrome PSK authentication
-/mcp    -> 127.0.0.1:18766 -> OAuth access-token authentication
-/v1/*   -> 127.0.0.1:18766 -> OAuth access-token authentication
+/mcp    -> 127.0.0.1:18766 -> Cloudflare Access Managed OAuth + origin JWT validation
+/v1/*   -> 127.0.0.1:18766 -> Cloudflare Access JWT validation when exposed
 ```
 
-When OAuth is enabled, unauthenticated MCP requests return `401` with a `WWW-Authenticate` challenge pointing at `/.well-known/oauth-protected-resource/mcp`. OAuth discovery exposes `/.well-known/oauth-authorization-server`, `/register`, `/authorize`, `/token`, and `/revoke`. The server supports DCR for Cloudflare MCP Portal automatic OAuth registration, Authorization Code + PKCE S256, refresh-token rotation, RFC 9207 `iss` on authorization responses, and persistent hashed token/client state.
+For the Cloudflare MCP Portal deployment:
 
-For the current Cloudflare setup, configure the upstream server URL as `https://unified-mcp.pentestsystem.com/mcp` with OAuth authentication. The default portal callback is `https://mcp.pentestsystem.com/servers-callback`, so `mcp.pentestsystem.com` must be in `UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`.
+1. Keep the tunnel route for `unified-mcp.pentestsystem.com` pointed at the local nginx listener on port 9443.
+2. Create a Cloudflare Access self-hosted/MCP application for `unified-mcp.pentestsystem.com/mcp*`. Do **not** include `/bridge` in that Access application.
+3. Enable **Managed OAuth** on that Access application.
+4. Allow the portal's upstream OAuth callback, normally `https://mcp.pentestsystem.com/servers-callback` (or Cloudflare's shared callback if you explicitly enabled it).
+5. Copy the Access application's Audience (AUD) tag and configure the Windows service with `-CloudflareAccessTeamDomain` and `-CloudflareAccessAudience`.
+6. Add `https://unified-mcp.pentestsystem.com/mcp` to the Cloudflare MCP Portal as an **OAuth** upstream server.
 
-Before authenticating the upstream server, create a Cloudflare Access **Self-hosted** application for `unified-mcp.pentestsystem.com/authorize*` and allow the intended administrator/user identity. Copy its **Application Audience (AUD) Tag** into the Windows installer parameters above. Only the browser-facing authorization endpoint needs this Access gate; `/.well-known/*`, `/register`, `/token`, `/revoke`, and `/mcp` remain available for OAuth protocol traffic.
+Cloudflare Access handles the OAuth discovery, DCR/authorization flow, token issuance, refresh, and policy enforcement at the edge. After a successful request reaches the origin, Access includes the user's signed identity JWT in `Cf-Access-Jwt-Assertion`. Unified MCP verifies that JWT's signature, issuer, audience, and expiration against the Access team's signing keys before processing MCP or REST requests. The Chrome PSK is not accepted as an HTTP credential while Cloudflare Access validation is configured.
 
 The backend discovers and forwards VibeTerm's project and terminal tools from `http://127.0.0.1:47821/mcp`, so clients need only this one endpoint. `chrome_browsers_list` lists available IDs. When exactly one browser is connected, `browserId` may be omitted; with multiple browsers it is required.
 
@@ -101,7 +108,7 @@ Run `deploy/windows/configure-codex-env.ps1` after installation. It shares the g
 ```http
 POST /mcp HTTP/1.1
 Host: localhost:9443
-Authorization: Bearer <PSK>
+Cf-Access-Jwt-Assertion: <ACCESS_JWT>
 Content-Type: application/json
 
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"chrome_tabs_list","arguments":{"browserId":"work-laptop"}}}
@@ -153,9 +160,9 @@ Available tools are `fs_roots_list`, `fs_list`, `fs_stat`, `fs_read_text`, `fs_w
 
 Open `https://localhost:9443/` for a live dashboard of connected browser clients, heartbeat times, and bridge metrics.
 
-`GET /health` is intentionally unauthenticated and returns service/browser connection metadata. `/v1/*` and `/openapi.json` require the Bearer PSK. Select a browser using `X-Browser-Id`, `?browserId=...`, or `browserId` in a JSON body.
+`GET /health` is intentionally unauthenticated and returns service/browser connection metadata. When Cloudflare Access validation is configured, `/mcp`, `/v1/*`, and `/openapi.json` require a valid `Cf-Access-Jwt-Assertion` from the configured Access application. Select a browser using `X-Browser-Id`, `?browserId=...`, or `browserId` in a JSON body.
 
-The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_OAUTH_ISSUER`, `UNIFIED_MCP_OAUTH_STATE_FILE`, `UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`, `UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN`, `UNIFIED_MCP_OAUTH_CF_ACCESS_AUD`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
+The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN`, `UNIFIED_MCP_CF_ACCESS_AUD`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
 
 ## Add more unified tools
 
