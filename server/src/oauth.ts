@@ -48,7 +48,6 @@ export type OAuthServerOptions = {
   issuer: string;
   resource: string;
   stateFile: string;
-  approvalSecret: string;
   allowedRedirectHosts?: string[];
   accessTokenLifetimeSeconds?: number;
   refreshTokenLifetimeSeconds?: number;
@@ -65,7 +64,6 @@ export class UnifiedMcpOAuthServer {
   readonly issuer: string;
   readonly resource: string;
   readonly stateFile: string;
-  readonly approvalSecret: string;
   readonly allowedRedirectHosts: string[];
   readonly accessTokenLifetimeSeconds: number;
   readonly refreshTokenLifetimeSeconds: number;
@@ -78,7 +76,6 @@ export class UnifiedMcpOAuthServer {
     this.issuer = stripTrailingSlash(options.issuer);
     this.resource = options.resource;
     this.stateFile = options.stateFile;
-    this.approvalSecret = options.approvalSecret;
     this.allowedRedirectHosts = (options.allowedRedirectHosts ?? [])
       .map((value) => value.trim().toLowerCase())
       .filter(Boolean);
@@ -88,16 +85,13 @@ export class UnifiedMcpOAuthServer {
     if (!/^https:\/\//i.test(this.issuer) && !isLoopbackUrl(this.issuer)) {
       throw new Error("UNIFIED_MCP_OAUTH_ISSUER must use HTTPS unless it is a loopback development URL");
     }
-    if (!this.approvalSecret) {
-      throw new Error("OAuth requires UNIFIED_MCP_OAUTH_APPROVAL_SECRET or the Unified MCP PSK");
-    }
-
     this.oauthState = this.loadState();
     this.cleanupPersistentState();
   }
 
   get resourceMetadataUrl() {
-    return `${this.issuer}/.well-known/oauth-protected-resource`;
+    const resourceUrl = new URL(this.resource);
+    return `${this.issuer}/.well-known/oauth-protected-resource${resourceUrl.pathname === "/" ? "" : resourceUrl.pathname}`;
   }
 
   get challengeHeader() {
@@ -340,21 +334,6 @@ export class UnifiedMcpOAuthServer {
       return this.redirectOAuthError(response, pending.redirectUri, pending.state, "access_denied");
     }
 
-    const suppliedSecret = form.get("approval_secret") || "";
-    if (!safeEqual(suppliedSecret, this.approvalSecret)) {
-      return this.sendHtml(
-        response,
-        401,
-        authorizationPage({
-          transaction,
-          clientName: client.clientName,
-          redirectUri: pending.redirectUri,
-          scope: pending.scope,
-          error: "The administrator PSK was not accepted.",
-        }),
-      );
-    }
-
     this.pendingAuthorizations.delete(transaction);
     const code = randomToken(32);
     this.authorizationCodes.set(code, {
@@ -528,7 +507,10 @@ export class UnifiedMcpOAuthServer {
     if (url.username || url.password || url.hash) {
       throw new Error("redirect_uri cannot contain credentials or a fragment");
     }
-    if (!loopback && this.allowedRedirectHosts.length && !hostAllowed(url.hostname, this.allowedRedirectHosts)) {
+    if (!loopback && !this.allowedRedirectHosts.length) {
+      throw new Error("Non-loopback redirect_uri values require UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS");
+    }
+    if (!loopback && !hostAllowed(url.hostname, this.allowedRedirectHosts)) {
       throw new Error(`redirect_uri host is not allowed: ${url.hostname}`);
     }
   }
@@ -780,7 +762,6 @@ function authorizationPage(input: {
   clientName: string;
   redirectUri: string;
   scope: string;
-  error?: string;
 }) {
   const target = new URL(input.redirectUri);
   return `<!doctype html>
@@ -793,9 +774,9 @@ function authorizationPage(input: {
 body{font:16px system-ui,sans-serif;background:#f5f5f5;color:#171717;margin:0}
 main{max-width:640px;margin:7vh auto;background:white;padding:32px;border-radius:14px;box-shadow:0 8px 35px #0001}
 h1{margin-top:0}.meta{background:#f3f4f6;padding:14px;border-radius:8px;overflow-wrap:anywhere}
-label{display:block;font-weight:600;margin:22px 0 8px}input{box-sizing:border-box;width:100%;padding:11px;border:1px solid #aaa;border-radius:7px}
+input{box-sizing:border-box;width:100%;padding:11px;border:1px solid #aaa;border-radius:7px}
 .actions{display:flex;gap:10px;margin-top:24px}button{padding:10px 18px;border:0;border-radius:7px;cursor:pointer}
-.approve{background:#111;color:#fff}.deny{background:#ddd}.error{color:#b42318;font-weight:600}
+.approve{background:#111;color:#fff}.deny{background:#ddd}
 </style>
 </head>
 <body>
@@ -803,11 +784,8 @@ label{display:block;font-weight:600;margin:22px 0 8px}input{box-sizing:border-bo
 <h1>Authorize Unified MCP</h1>
 <p><strong>${escapeHtml(input.clientName)}</strong> is requesting access to Unified MCP.</p>
 <div class="meta"><strong>Redirect:</strong> ${escapeHtml(target.origin)}<br><strong>Scopes:</strong> ${escapeHtml(input.scope)}</div>
-${input.error ? `<p class="error">${escapeHtml(input.error)}</p>` : ""}
 <form method="post" action="/authorize">
 <input type="hidden" name="transaction" value="${escapeHtml(input.transaction)}">
-<label for="approval_secret">Unified MCP administrator PSK</label>
-<input id="approval_secret" name="approval_secret" type="password" autocomplete="current-password" required autofocus>
 <div class="actions">
 <button class="approve" type="submit" name="action" value="approve">Authorize</button>
 <button class="deny" type="submit" name="action" value="deny" formnovalidate>Deny</button>
