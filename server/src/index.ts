@@ -11,10 +11,10 @@ import { filesystemCall, filesystemTools, ownsFilesystemTool } from "./filesyste
 import { CloudflareAccessError, CloudflareAccessValidator } from "./cloudflare-access.js";
 
 const require = createRequire(import.meta.url);
-const SERVER_PORT = Number(process.env.UNIFIED_MCP_PORT ?? process.env.CHROME_SERVER_PORT ?? 18766);
+const SERVER_PORT = Number(process.env.UNIFIED_MCP_PORT ?? process.env.CHROME_API_PORT ?? 18766);
 const BIND_HOST = process.env.UNIFIED_MCP_BIND_HOST ?? process.env.CHROME_BIND_HOST ?? "127.0.0.1";
 const AGENT_API_HOST = process.env.CHROME_AGENT_API_HOST || "";
-const AGENT_SERVER_PORT = Number(process.env.CHROME_AGENT_SERVER_PORT ?? 0);
+const AGENT_API_PORT = Number(process.env.CHROME_AGENT_API_PORT ?? 0);
 const REQUEST_TIMEOUT_MS = Number(process.env.CHROME_MCP_TIMEOUT_MS ?? 15000);
 const DEBUG_LOG = process.env.CHROME_MCP_DEBUG_LOG || join(process.cwd(), "chrome-mcp-debug.log");
 const PUBLIC_DIR = join(process.cwd(), "public");
@@ -25,7 +25,7 @@ const CF_ACCESS_CERTS_URL = process.env.UNIFIED_MCP_CF_ACCESS_CERTS_URL || "";
 
 type ChromeRequest = { type: "request"; id: string; method: string; params?: Record<string, unknown> };
 type ChromeResponse = { type: "response"; id: string; ok: boolean; result?: unknown; error?: string };
-type BridgeMessage = ChromeResponse | { type: "heartbeat"; time?: number } | { type: "hello"; role: "extension"; browserId?: string; browserName?: string; psk?: string };
+type BridgeMessage = ChromeResponse | { type: "heartbeat"; time?: number } | { type: "hello"; role: "extension"; browserId?: string; browserName?: string };
 type ProtocolDomain = { domain: string; description?: string; experimental?: boolean; deprecated?: boolean; dependencies?: string[]; types?: unknown[]; commands?: unknown[]; events?: unknown[] };
 type ProtocolDefinition = { version: { major: string; minor: string }; domains: ProtocolDomain[] };
 type JsonRpcRequest = { jsonrpc: "2.0"; id?: string | number; method: string; params?: Record<string, unknown> };
@@ -111,12 +111,12 @@ api.on("error", (error) => {
   console.error(`Chrome API failed: ${error.message}`);
   process.exitCode = 1;
 });
-if (AGENT_API_HOST || AGENT_SERVER_PORT) {
-  if (!AGENT_API_HOST || !Number.isInteger(AGENT_SERVER_PORT) || AGENT_SERVER_PORT < 1 || AGENT_SERVER_PORT > 65535) {
-    throw new Error("CHROME_AGENT_API_HOST and a valid CHROME_AGENT_SERVER_PORT must be configured together");
+if (AGENT_API_HOST || AGENT_API_PORT) {
+  if (!AGENT_API_HOST || !Number.isInteger(AGENT_API_PORT) || AGENT_API_PORT < 1 || AGENT_API_PORT > 65535) {
+    throw new Error("CHROME_AGENT_API_HOST and a valid CHROME_AGENT_API_PORT must be configured together");
   }
   const agentApi = createServer(apiHandler);
-  agentApi.listen(AGENT_SERVER_PORT, AGENT_API_HOST, () => debug("agent-api-start", { agentApiPort: AGENT_SERVER_PORT, agentApiHost: AGENT_API_HOST, pid: process.pid }));
+  agentApi.listen(AGENT_API_PORT, AGENT_API_HOST, () => debug("agent-api-start", { agentApiPort: AGENT_API_PORT, agentApiHost: AGENT_API_HOST, pid: process.pid }));
   agentApi.on("error", (error) => {
     debug("agent-api-error", { message: error.message });
     console.error(`Chrome agent API failed: ${error.message}`);
