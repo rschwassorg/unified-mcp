@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
@@ -49,6 +49,8 @@ export type OAuthServerOptions = {
   resource: string;
   stateFile: string;
   allowedRedirectHosts?: string[];
+  cloudflareAccessTeamDomain?: string;
+  cloudflareAccessAudience?: string;
   accessTokenLifetimeSeconds?: number;
   refreshTokenLifetimeSeconds?: number;
 };
@@ -65,10 +67,13 @@ export class UnifiedMcpOAuthServer {
   readonly resource: string;
   readonly stateFile: string;
   readonly allowedRedirectHosts: string[];
+  readonly cloudflareAccessTeamDomain?: string;
+  readonly cloudflareAccessAudience?: string;
   readonly accessTokenLifetimeSeconds: number;
   readonly refreshTokenLifetimeSeconds: number;
 
   private oauthState: OAuthState;
+  private cloudflareKeys?: { expiresAt: number; keys: Array<Record<string, unknown>> };
   private pendingAuthorizations = new Map<string, PendingAuthorization>();
   private authorizationCodes = new Map<string, AuthorizationCode>();
 
@@ -79,11 +84,21 @@ export class UnifiedMcpOAuthServer {
     this.allowedRedirectHosts = (options.allowedRedirectHosts ?? [])
       .map((value) => value.trim().toLowerCase())
       .filter(Boolean);
+    this.cloudflareAccessTeamDomain = options.cloudflareAccessTeamDomain
+      ? stripTrailingSlash(options.cloudflareAccessTeamDomain)
+      : undefined;
+    this.cloudflareAccessAudience = options.cloudflareAccessAudience?.trim() || undefined;
     this.accessTokenLifetimeSeconds = options.accessTokenLifetimeSeconds ?? 3600;
     this.refreshTokenLifetimeSeconds = options.refreshTokenLifetimeSeconds ?? 30 * 24 * 60 * 60;
 
     if (!/^https:\/\//i.test(this.issuer) && !isLoopbackUrl(this.issuer)) {
       throw new Error("UNIFIED_MCP_OAUTH_ISSUER must use HTTPS unless it is a loopback development URL");
+    }
+    if (!isLoopbackUrl(this.issuer) && (!this.cloudflareAccessTeamDomain || !this.cloudflareAccessAudience)) {
+      throw new Error("Production OAuth requires UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN and UNIFIED_MCP_OAUTH_CF_ACCESS_AUD");
+    }
+    if (this.cloudflareAccessTeamDomain && !/^https:\/\/[^/]+\.cloudflareaccess\.com$/i.test(this.cloudflareAccessTeamDomain)) {
+      throw new Error("UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN must be an https://*.cloudflareaccess.com origin");
     }
     this.oauthState = this.loadState();
     this.cleanupPersistentState();
@@ -167,12 +182,20 @@ export class UnifiedMcpOAuthServer {
     }
 
     if (url.pathname === "/authorize") {
+      let identity: string | undefined;
+      try {
+        identity = await this.authenticateAuthorizationUser(request);
+      } catch (error) {
+        const status = error instanceof OAuthHttpError ? error.status : 403;
+        this.sendHtml(response, status, authPage(errorMessage(error)));
+        return true;
+      }
       if (request.method === "GET") {
-        this.handleAuthorizationStart(response, url);
+        this.handleAuthorizationStart(response, url, identity);
         return true;
       }
       if (request.method === "POST") {
-        await this.handleAuthorizationDecision(request, response);
+        await this.handleAuthorizationDecision(request, response, identity);
         return true;
       }
       response.writeHead(405, { Allow: "GET, POST" }).end();
@@ -198,6 +221,76 @@ export class UnifiedMcpOAuthServer {
     }
 
     return false;
+  }
+
+  private async authenticateAuthorizationUser(request: IncomingMessage): Promise<string | undefined> {
+    if (isLoopbackUrl(this.issuer)) return undefined;
+
+    const token = String(request.headers["cf-access-jwt-assertion"] || "");
+    if (!token) throw new OAuthHttpError(403, "Cloudflare Access JWT is required for OAuth authorization");
+
+    const parts = token.split(".");
+    if (parts.length !== 3) throw new OAuthHttpError(403, "Cloudflare Access JWT is malformed");
+
+    let header: Record<string, unknown>;
+    let payload: Record<string, unknown>;
+    try {
+      header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")) as Record<string, unknown>;
+      payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
+    } catch {
+      throw new OAuthHttpError(403, "Cloudflare Access JWT is malformed");
+    }
+
+    if (header.alg !== "RS256" || typeof header.kid !== "string") {
+      throw new OAuthHttpError(403, "Cloudflare Access JWT uses an unsupported signing algorithm");
+    }
+
+    const keys = await this.getCloudflareAccessKeys();
+    const jwk = keys.find((value) => value.kid === header.kid);
+    if (!jwk) {
+      this.cloudflareKeys = undefined;
+      const refreshed = await this.getCloudflareAccessKeys();
+      const retryKey = refreshed.find((value) => value.kid === header.kid);
+      if (!retryKey) throw new OAuthHttpError(403, "Cloudflare Access signing key is unknown");
+      if (!verifyJwtSignature(parts, retryKey)) throw new OAuthHttpError(403, "Cloudflare Access JWT signature is invalid");
+    } else if (!verifyJwtSignature(parts, jwk)) {
+      throw new OAuthHttpError(403, "Cloudflare Access JWT signature is invalid");
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.iss !== this.cloudflareAccessTeamDomain) {
+      throw new OAuthHttpError(403, "Cloudflare Access JWT issuer is invalid");
+    }
+    const audiences = Array.isArray(payload.aud) ? payload.aud.map(String) : [String(payload.aud || "")];
+    if (!this.cloudflareAccessAudience || !audiences.includes(this.cloudflareAccessAudience)) {
+      throw new OAuthHttpError(403, "Cloudflare Access JWT audience is invalid");
+    }
+    if (typeof payload.exp !== "number" || payload.exp <= now) {
+      throw new OAuthHttpError(403, "Cloudflare Access JWT is expired");
+    }
+    if (typeof payload.nbf === "number" && payload.nbf > now + 60) {
+      throw new OAuthHttpError(403, "Cloudflare Access JWT is not active yet");
+    }
+
+    return typeof payload.email === "string"
+      ? payload.email
+      : typeof payload.sub === "string"
+        ? payload.sub
+        : "Cloudflare Access user";
+  }
+
+  private async getCloudflareAccessKeys(): Promise<Array<Record<string, unknown>>> {
+    if (this.cloudflareKeys && this.cloudflareKeys.expiresAt > Date.now()) return this.cloudflareKeys.keys;
+    const response = await fetch(`${this.cloudflareAccessTeamDomain}/cdn-cgi/access/certs`, {
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok) throw new OAuthHttpError(503, `Unable to fetch Cloudflare Access signing keys: ${response.status}`);
+    const body = await response.json() as { keys?: Array<Record<string, unknown>> };
+    if (!Array.isArray(body.keys) || !body.keys.length) {
+      throw new OAuthHttpError(503, "Cloudflare Access signing-key response did not contain keys");
+    }
+    this.cloudflareKeys = { expiresAt: Date.now() + 5 * 60 * 1000, keys: body.keys };
+    return body.keys;
   }
 
   private async handleRegistration(request: IncomingMessage, response: ServerResponse) {
@@ -263,7 +356,7 @@ export class UnifiedMcpOAuthServer {
     );
   }
 
-  private handleAuthorizationStart(response: ServerResponse, url: URL) {
+  private handleAuthorizationStart(response: ServerResponse, url: URL, identity?: string) {
     this.cleanupEphemeralState();
 
     const responseType = url.searchParams.get("response_type") || "";
@@ -309,11 +402,12 @@ export class UnifiedMcpOAuthServer {
         clientName: client.clientName,
         redirectUri,
         scope,
+        identity,
       }),
     );
   }
 
-  private async handleAuthorizationDecision(request: IncomingMessage, response: ServerResponse) {
+  private async handleAuthorizationDecision(request: IncomingMessage, response: ServerResponse, identity?: string) {
     this.cleanupEphemeralState();
     const form = await readFormBody(request);
     const transaction = form.get("transaction") || "";
@@ -332,6 +426,10 @@ export class UnifiedMcpOAuthServer {
     if ((form.get("action") || "") === "deny") {
       this.pendingAuthorizations.delete(transaction);
       return this.redirectOAuthError(response, pending.redirectUri, pending.state, "access_denied");
+    }
+
+    if (!identity && !isLoopbackUrl(this.issuer)) {
+      return this.sendHtml(response, 403, authPage("Cloudflare Access authentication is required."));
     }
 
     this.pendingAuthorizations.delete(transaction);
@@ -725,10 +823,24 @@ function isLoopbackUrl(value: string) {
   }
 }
 
-function safeEqual(left: string, right: string) {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
+function verifyJwtSignature(parts: string[], jwk: Record<string, unknown>) {
+  try {
+    const key = createPublicKey({ key: jwk as never, format: "jwk" });
+    return verifySignature(
+      "RSA-SHA256",
+      Buffer.from(`${parts[0]}.${parts[1]}`, "ascii"),
+      key,
+      Buffer.from(parts[2], "base64url"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+class OAuthHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
 }
 
 function escapeHtml(value: string) {
@@ -762,6 +874,7 @@ function authorizationPage(input: {
   clientName: string;
   redirectUri: string;
   scope: string;
+  identity?: string;
 }) {
   const target = new URL(input.redirectUri);
   return `<!doctype html>
@@ -783,6 +896,7 @@ input{box-sizing:border-box;width:100%;padding:11px;border:1px solid #aaa;border
 <main>
 <h1>Authorize Unified MCP</h1>
 <p><strong>${escapeHtml(input.clientName)}</strong> is requesting access to Unified MCP.</p>
+${input.identity ? `<p>Signed in through Cloudflare Access as <strong>${escapeHtml(input.identity)}</strong>.</p>` : ""}
 <div class="meta"><strong>Redirect:</strong> ${escapeHtml(target.origin)}<br><strong>Scopes:</strong> ${escapeHtml(input.scope)}</div>
 <form method="post" action="/authorize">
 <input type="hidden" name="transaction" value="${escapeHtml(input.transaction)}">
