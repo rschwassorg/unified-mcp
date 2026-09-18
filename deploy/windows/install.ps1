@@ -21,6 +21,58 @@ if ($Port -lt 1 -or $Port -gt 65535) {
   throw "Port must be between 1 and 65535"
 }
 
+function Stop-And-UninstallWinSwService {
+  param(
+    [Parameter(Mandatory)] [string] $Name,
+    [Parameter(Mandatory)] [string] $WrapperExe
+  )
+
+  $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+  if ($service -and $service.Status -ne "Stopped") {
+    Write-Host "Stopping service '$Name'..."
+    Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+    try {
+      (Get-Service -Name $Name -ErrorAction Stop).WaitForStatus(
+        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+        [TimeSpan]::FromSeconds(15)
+      )
+    }
+    catch {
+      Write-Warning "Service '$Name' did not report Stopped immediately; continuing with WinSW cleanup."
+    }
+  }
+
+  if (Test-Path -LiteralPath $WrapperExe) {
+    try {
+      & $WrapperExe uninstall 2>$null
+    }
+    catch {
+      Write-Warning "WinSW uninstall for '$Name' returned an error: $($_.Exception.Message)"
+    }
+  }
+
+  # WinSW can return from stop/uninstall before the wrapper process releases its
+  # executable. Wait for the file lock to clear before overwriting the wrapper.
+  if (Test-Path -LiteralPath $WrapperExe) {
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+      try {
+        $stream = [IO.File]::Open(
+          $WrapperExe,
+          [IO.FileMode]::Open,
+          [IO.FileAccess]::ReadWrite,
+          [IO.FileShare]::None
+        )
+        $stream.Dispose()
+        return
+      }
+      catch {
+        Start-Sleep -Milliseconds 250
+      }
+    }
+    throw "Timed out waiting for service wrapper to be released: $WrapperExe"
+  }
+}
+
 New-Item -ItemType Directory -Force -Path $serviceRoot,$logRoot | Out-Null
 if (-not (Test-Path -LiteralPath $filesystemConfigPath)) {
   $defaultCodeRoot = Join-Path $env:USERPROFILE "code"
@@ -64,18 +116,22 @@ $backendXml = @"
 
 Write-Host "Phase: remove legacy nginx service"
 $legacyNginxExe = Join-Path $serviceRoot "UnifiedMcpNginx.exe"
-if (Test-Path -LiteralPath $legacyNginxExe) {
-  & $legacyNginxExe stop 2>$null
-  & $legacyNginxExe uninstall 2>$null
+if ((Get-Service -Name "UnifiedMcpNginx" -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $legacyNginxExe)) {
+  Stop-And-UninstallWinSwService -Name "UnifiedMcpNginx" -WrapperExe $legacyNginxExe
 }
 
 Write-Host "Phase: Windows service"
 $backendExe = Join-Path $serviceRoot "UnifiedMcpBackend.exe"
 $backendXmlPath = Join-Path $serviceRoot "UnifiedMcpBackend.xml"
+
+# Stop/uninstall the existing wrapper before replacing it. Copying over a
+# running WinSW executable fails on Windows with "file is being used by another process".
+if ((Get-Service -Name "UnifiedMcpBackend" -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $backendExe)) {
+  Stop-And-UninstallWinSwService -Name "UnifiedMcpBackend" -WrapperExe $backendExe
+}
+
 Copy-Item -Force -LiteralPath $winswPath -Destination $backendExe
 Set-Content -LiteralPath $backendXmlPath -Value $backendXml -Encoding utf8
-& $backendExe stop 2>$null
-& $backendExe uninstall 2>$null
 & $backendExe install
 if ($LASTEXITCODE -ne 0) { throw "Failed to install UnifiedMcpBackend" }
 & $backendExe start
