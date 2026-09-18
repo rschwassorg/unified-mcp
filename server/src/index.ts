@@ -20,7 +20,7 @@ const REQUEST_TIMEOUT_MS = Number(process.env.CHROME_MCP_TIMEOUT_MS ?? 15000);
 const DEBUG_LOG = process.env.CHROME_MCP_DEBUG_LOG || join(process.cwd(), "chrome-mcp-debug.log");
 const PUBLIC_DIR = join(process.cwd(), "public");
 const VIBETERM_MCP_URL = process.env.VIBETERM_MCP_URL ?? "http://127.0.0.1:47821/mcp";
-const OAUTH_ISSUER = (process.env.UNIFIED_MCP_OAUTH_ISSUER || "").replace(/\\\/+$/, "");
+const OAUTH_ISSUER = (process.env.UNIFIED_MCP_OAUTH_ISSUER || "").replace(/\/+$/, "");
 const OAUTH_STATE_FILE = process.env.UNIFIED_MCP_OAUTH_STATE_FILE || join(process.cwd(), "oauth-state.json");
 const OAUTH_ALLOWED_REDIRECT_HOSTS = (process.env.UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS || "")
   .split(",").map((value) => value.trim()).filter(Boolean);
@@ -319,7 +319,7 @@ function mcpTool(name: string, description: string, properties: Record<string, u
 function mcpText(value: unknown) { return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] }; }
 function respondMcp(id: string | number, result: unknown) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`); }
 function respondMcpError(id: string | number, message: string) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`); }
-function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], apiPort: API_PORT, bridgePort: BRIDGE_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : oauthServer ? "oauth+psk" : ALLOW_LOOPBACK_NO_AUTH ? "psk-with-loopback-bypass" : "psk", oauthIssuer: oauthServer?.issuer }; }
+function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], apiPort: API_PORT, bridgePort: BRIDGE_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : oauthServer ? "oauth-http+psk-browser" : ALLOW_LOOPBACK_NO_AUTH ? "psk-with-loopback-bypass" : "psk", oauthIssuer: oauthServer?.issuer }; }
 function registerBrowser(socket: WebSocket, id: string, name: string) {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(id)) return socket.close(1008, "Invalid browserId");
   const previous = browsers.get(id);
