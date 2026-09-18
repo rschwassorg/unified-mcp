@@ -17,7 +17,7 @@ await mkdir(readonly);
 await mkdir(outside);
 await writeFile(join(readonly, "existing.txt"), "read only\n", "utf8");
 await writeFile(join(outside, "secret.txt"), "outside\n", "utf8");
-await writeFile(configPath, JSON.stringify({
+await writeFile(configPath, "\uFEFF" + JSON.stringify({
   roots: {
     work: { path: writable, readOnly: false },
     docs: { path: readonly, readOnly: true }

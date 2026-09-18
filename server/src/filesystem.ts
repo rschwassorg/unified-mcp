@@ -271,7 +271,8 @@ async function loadRoots(): Promise<Map<string, FilesystemRoot>> {
   if (!configPath) throw new Error("UNIFIED_MCP_FS_CONFIG is not configured and ProgramData is unavailable");
   let parsed: FilesystemConfig;
   try {
-    parsed = JSON.parse(await readFile(configPath, "utf8")) as FilesystemConfig;
+    const raw = await readFile(configPath, "utf8");
+    parsed = JSON.parse(raw.replace(/^\\uFEFF/, "")) as FilesystemConfig;
   } catch (error) {
     throw new Error(`Unable to read filesystem configuration at ${configPath}: ${errorMessage(error)}`);
   }

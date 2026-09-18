@@ -24,7 +24,8 @@ New-Item -ItemType Directory -Force -Path $serviceRoot,$secretRoot,$certRoot,$lo
 if (-not (Test-Path -LiteralPath $filesystemConfigPath)) {
   $defaultCodeRoot = Join-Path $env:USERPROFILE "code"
   $filesystemConfig = @{ roots = @{ code = @{ path = $defaultCodeRoot; readOnly = $false } } } | ConvertTo-Json -Depth 5
-  Set-Content -LiteralPath $filesystemConfigPath -Value $filesystemConfig -Encoding utf8
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($filesystemConfigPath, $filesystemConfig, $utf8NoBom)
 }
 npm --prefix (Join-Path $projectRoot "server") ci
 npm --prefix (Join-Path $projectRoot "server") run build
