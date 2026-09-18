@@ -8,7 +8,7 @@ import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { HttpMcpUpstream } from "./mcp-upstream.js";
 import { filesystemCall, filesystemTools, ownsFilesystemTool } from "./filesystem.js";
-import { UnifiedMcpOAuthServer } from "./oauth.js";
+import { CloudflareAccessError, CloudflareAccessValidator } from "./cloudflare-access.js";
 
 const require = createRequire(import.meta.url);
 const BRIDGE_PORT = Number(process.env.CHROME_MCP_PORT ?? 18765);
@@ -20,12 +20,9 @@ const REQUEST_TIMEOUT_MS = Number(process.env.CHROME_MCP_TIMEOUT_MS ?? 15000);
 const DEBUG_LOG = process.env.CHROME_MCP_DEBUG_LOG || join(process.cwd(), "chrome-mcp-debug.log");
 const PUBLIC_DIR = join(process.cwd(), "public");
 const VIBETERM_MCP_URL = process.env.VIBETERM_MCP_URL ?? "http://127.0.0.1:47821/mcp";
-const OAUTH_ISSUER = (process.env.UNIFIED_MCP_OAUTH_ISSUER || "").replace(/\/+$/, "");
-const OAUTH_STATE_FILE = process.env.UNIFIED_MCP_OAUTH_STATE_FILE || join(process.cwd(), "oauth-state.json");
-const OAUTH_ALLOWED_REDIRECT_HOSTS = (process.env.UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS || "")
-  .split(",").map((value) => value.trim()).filter(Boolean);
-const OAUTH_CF_ACCESS_TEAM_DOMAIN = process.env.UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN || "";
-const OAUTH_CF_ACCESS_AUD = process.env.UNIFIED_MCP_OAUTH_CF_ACCESS_AUD || "";
+const CF_ACCESS_TEAM_DOMAIN = process.env.UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN || "";
+const CF_ACCESS_AUD = process.env.UNIFIED_MCP_CF_ACCESS_AUD || "";
+const CF_ACCESS_CERTS_URL = process.env.UNIFIED_MCP_CF_ACCESS_CERTS_URL || "";
 
 type ChromeRequest = { type: "request"; id: string; method: string; params?: Record<string, unknown> };
 type ChromeResponse = { type: "response"; id: string; ok: boolean; result?: unknown; error?: string };
@@ -41,13 +38,10 @@ const cdpProtocol: ProtocolDefinition = { version: browserProtocol.version, doma
 const PSK = process.env.UNIFIED_MCP_PSK || (process.env.UNIFIED_MCP_PSK_FILE ? readFileSync(process.env.UNIFIED_MCP_PSK_FILE, "utf8").trim() : "");
 const ALLOW_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_NO_AUTH === "true";
 const ALLOW_LOOPBACK_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_LOOPBACK_NO_AUTH === "true";
-const oauthServer = OAUTH_ISSUER ? new UnifiedMcpOAuthServer({
-  issuer: OAUTH_ISSUER,
-  resource: `${OAUTH_ISSUER}/mcp`,
-  stateFile: OAUTH_STATE_FILE,
-  allowedRedirectHosts: OAUTH_ALLOWED_REDIRECT_HOSTS,
-  cloudflareAccessTeamDomain: OAUTH_CF_ACCESS_TEAM_DOMAIN,
-  cloudflareAccessAudience: OAUTH_CF_ACCESS_AUD,
+const cloudflareAccess = CF_ACCESS_TEAM_DOMAIN && CF_ACCESS_AUD ? new CloudflareAccessValidator({
+  teamDomain: CF_ACCESS_TEAM_DOMAIN,
+  audience: CF_ACCESS_AUD,
+  certsUrl: CF_ACCESS_CERTS_URL || undefined,
 }) : undefined;
 type BrowserConnection = { id: string; name: string; socket: WebSocket; connectedAt: string; lastSeenAt: string };
 const pending = new Map<string, { browserId: string; resolve: (value: unknown) => void; reject: (reason: Error) => void; timeout: NodeJS.Timeout }>();
@@ -200,12 +194,11 @@ async function unifiedMcpTools() {
 async function handleHttp(request: IncomingMessage, response: ServerResponse) {
   const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
   try {
-    if (oauthServer && await oauthServer.handlePublicEndpoint(request, response, url)) return;
     if (request.method === "GET" && ["/", "/app.js", "/styles.css"].includes(url.pathname)) return sendDashboardAsset(response, url.pathname);
     if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, serverStatus());
-    if (request.method === "GET" && url.pathname === "/openapi.json") { authorize(request); return sendJson(response, 200, openApi()); }
+    if (request.method === "GET" && url.pathname === "/openapi.json") { await authorize(request); return sendJson(response, 200, openApi()); }
     if (url.pathname === "/mcp") {
-      authorize(request);
+      await authorize(request);
       if (request.method !== "POST") throw new HttpError(405, "MCP uses POST");
       const rpc = await readJson(request) as JsonRpcRequest;
       if (!rpc.jsonrpc || !rpc.method) throw new HttpError(400, "Invalid JSON-RPC request");
@@ -213,7 +206,7 @@ async function handleHttp(request: IncomingMessage, response: ServerResponse) {
       try { return sendJson(response, 200, { jsonrpc: "2.0", id: rpc.id, result: await handleMcpRequest(rpc) }); }
       catch (error) { return sendJson(response, 200, { jsonrpc: "2.0", id: rpc.id, error: { code: -32000, message: errorMessage(error) } }); }
     }
-    authorize(request);
+    await authorize(request);
 
     const body = request.method === "GET" || request.method === "DELETE" ? {} : await readJson(request);
     body.browserId ??= request.headers["x-browser-id"] || url.searchParams.get("browserId") || undefined;
@@ -323,7 +316,7 @@ function mcpTool(name: string, description: string, properties: Record<string, u
 function mcpText(value: unknown) { return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] }; }
 function respondMcp(id: string | number, result: unknown) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`); }
 function respondMcpError(id: string | number, message: string) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`); }
-function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], apiPort: API_PORT, bridgePort: BRIDGE_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : oauthServer ? "oauth-http+psk-browser" : ALLOW_LOOPBACK_NO_AUTH ? "psk-with-loopback-bypass" : "psk", oauthIssuer: oauthServer?.issuer }; }
+function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], apiPort: API_PORT, bridgePort: BRIDGE_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : cloudflareAccess ? "cloudflare-access-http+psk-browser" : ALLOW_LOOPBACK_NO_AUTH ? "psk-with-loopback-bypass" : "psk", cloudflareAccessTeam: cloudflareAccess?.teamDomain }; }
 function registerBrowser(socket: WebSocket, id: string, name: string) {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(id)) return socket.close(1008, "Invalid browserId");
   const previous = browsers.get(id);
@@ -340,15 +333,20 @@ function selectBrowser(value: unknown) {
   if (!browser || browser.socket.readyState !== WebSocket.OPEN) throw new HttpError(503, `Browser is not connected: ${id}`);
   return browser;
 }
-function authorize(request: IncomingMessage) {
+async function authorize(request: IncomingMessage) {
   if (ALLOW_NO_AUTH) return;
   if (ALLOW_LOOPBACK_NO_AUTH && isDirectLoopbackRequest(request)) return;
-  const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (oauthServer) {
-    if (oauthServer.isAccessToken(supplied)) return;
-    throw new HttpError(401, "Unauthorized", { "WWW-Authenticate": oauthServer.challengeHeader });
+  if (cloudflareAccess) {
+    try {
+      await cloudflareAccess.authenticate(request);
+      return;
+    } catch (error) {
+      if (error instanceof CloudflareAccessError) throw new HttpError(error.status, error.message);
+      throw error;
+    }
   }
   if (!PSK) throw new HttpError(503, "Unified MCP HTTP authentication is not configured");
+  const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
   if (!safeEqual(supplied, PSK)) throw new HttpError(401, "Unauthorized");
 }
 function isDirectLoopbackRequest(request: IncomingMessage) {
