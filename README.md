@@ -92,6 +92,8 @@ When OAuth is enabled, unauthenticated MCP requests return `401` with a `WWW-Aut
 
 For the current Cloudflare setup, configure the upstream server URL as `https://unified-mcp.pentestsystem.com/mcp` with OAuth authentication. The default portal callback is `https://mcp.pentestsystem.com/servers-callback`, so `mcp.pentestsystem.com` must be in `UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`.
 
+Before authenticating the upstream server, create a Cloudflare Access **Self-hosted** application for `unified-mcp.pentestsystem.com/authorize*` and allow the intended administrator/user identity. Copy its **Application Audience (AUD) Tag** into the Windows installer parameters above. Only the browser-facing authorization endpoint needs this Access gate; `/.well-known/*`, `/register`, `/token`, `/revoke`, and `/mcp` remain available for OAuth protocol traffic.
+
 The backend discovers and forwards VibeTerm's project and terminal tools from `http://127.0.0.1:47821/mcp`, so clients need only this one endpoint. `chrome_browsers_list` lists available IDs. When exactly one browser is connected, `browserId` may be omitted; with multiple browsers it is required.
 
 Run `deploy/windows/configure-codex-env.ps1` after installation. It shares the gateway PSK with VibeTerm, trusts the TLS certificate in Windows and WSL, and maps `unified-mcp.local` to WSL's current Windows-host gateway. VibeTerm refreshes that WSL route whenever it starts its Codex app server.
@@ -153,7 +155,7 @@ Open `https://localhost:9443/` for a live dashboard of connected browser clients
 
 `GET /health` is intentionally unauthenticated and returns service/browser connection metadata. `/v1/*` and `/openapi.json` require the Bearer PSK. Select a browser using `X-Browser-Id`, `?browserId=...`, or `browserId` in a JSON body.
 
-The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_OAUTH_ISSUER`, `UNIFIED_MCP_OAUTH_STATE_FILE`, `UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
+The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_OAUTH_ISSUER`, `UNIFIED_MCP_OAUTH_STATE_FILE`, `UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`, `UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN`, `UNIFIED_MCP_OAUTH_CF_ACCESS_AUD`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
 
 ## Add more unified tools
 
