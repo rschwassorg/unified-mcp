@@ -15,12 +15,12 @@ nginx terminates TLS but does not execute MCP logic. On Windows, nginx and the N
 
 - TLS is required on the exposed listener.
 - Browsers authenticate in their first WSS message with a pre-shared key.
-- MCP and REST clients use `Authorization: Bearer <PSK>`.
+- MCP and REST clients use `Authorization: Bearer <OAUTH_ACCESS_TOKEN>`.
 - The Windows installer generates a 256-bit PSK under `%ProgramData%\UnifiedMcp\secrets`, accessible only to SYSTEM and Administrators.
 - The PSK is never written into nginx configuration, service XML, logs, or source control.
 - The included certificate is self-signed. Import its public `.crt` into Trusted Root Certification Authorities on every client machine. Replace it with a trusted certificate before wider use.
 
-Anyone holding the PSK can fully control connected browsers and any configured writable filesystem roots. Use a firewall allowlist, rotate the PSK if exposed, expose only the minimum required filesystem roots, and do not expose port 9443 directly to the public internet.
+Anyone holding the Chrome PSK can connect a browser bridge client. OAuth access tokens control HTTP MCP/REST access when OAuth is enabled. Expose only the minimum required filesystem roots and keep the public MCP endpoint behind the intended reverse proxy/tunnel.
 
 ### Temporary local no-auth mode
 
@@ -80,7 +80,21 @@ For remote browser machines use a DNS name or IP covered by the certificate. The
 
 ## MCP configuration
 
-The Streamable HTTP endpoint is `https://localhost:9443/mcp`. Configure the MCP client to send the PSK as a Bearer token. The backend discovers and forwards VibeTerm's project and terminal tools from `http://127.0.0.1:47821/mcp`, so clients need only this one endpoint. `chrome_browsers_list` lists available IDs. When exactly one browser is connected, `browserId` may be omitted; with multiple browsers it is required.
+The Streamable HTTP endpoint is `https://localhost:9443/mcp`. The Chrome bridge and HTTP MCP endpoint use separate authentication paths:
+
+```text
+/bridge -> 127.0.0.1:18765 -> Chrome PSK authentication
+/mcp    -> 127.0.0.1:18766 -> OAuth access-token authentication
+/v1/*   -> 127.0.0.1:18766 -> OAuth access-token authentication
+```
+
+When OAuth is enabled, unauthenticated MCP requests return `401` with a `WWW-Authenticate` challenge pointing at `/.well-known/oauth-protected-resource/mcp`. OAuth discovery exposes `/.well-known/oauth-authorization-server`, `/register`, `/authorize`, `/token`, and `/revoke`. The server supports DCR for Cloudflare MCP Portal automatic OAuth registration, Authorization Code + PKCE S256, refresh-token rotation, RFC 9207 `iss` on authorization responses, and persistent hashed token/client state.
+
+For the current Cloudflare setup, configure the upstream server URL as `https://unified-mcp.pentestsystem.com/mcp` with OAuth authentication. The default portal callback is `https://mcp.pentestsystem.com/servers-callback`, so `mcp.pentestsystem.com` must be in `UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`.
+
+Before authenticating the upstream server, create a Cloudflare Access **Self-hosted** application for `unified-mcp.pentestsystem.com/authorize*` and allow the intended administrator/user identity. Copy its **Application Audience (AUD) Tag** into the Windows installer parameters above. Only the browser-facing authorization endpoint needs this Access gate; `/.well-known/*`, `/register`, `/token`, `/revoke`, and `/mcp` remain available for OAuth protocol traffic.
+
+The backend discovers and forwards VibeTerm's project and terminal tools from `http://127.0.0.1:47821/mcp`, so clients need only this one endpoint. `chrome_browsers_list` lists available IDs. When exactly one browser is connected, `browserId` may be omitted; with multiple browsers it is required.
 
 Run `deploy/windows/configure-codex-env.ps1` after installation. It shares the gateway PSK with VibeTerm, trusts the TLS certificate in Windows and WSL, and maps `unified-mcp.local` to WSL's current Windows-host gateway. VibeTerm refreshes that WSL route whenever it starts its Codex app server.
 
@@ -141,7 +155,7 @@ Open `https://localhost:9443/` for a live dashboard of connected browser clients
 
 `GET /health` is intentionally unauthenticated and returns service/browser connection metadata. `/v1/*` and `/openapi.json` require the Bearer PSK. Select a browser using `X-Browser-Id`, `?browserId=...`, or `browserId` in a JSON body.
 
-The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
+The loopback defaults are port 18765 for browser WebSockets, 18766 for the Unified MCP/REST backend, and 47821 for VibeTerm. Relevant environment variables include `CHROME_MCP_PORT`, `CHROME_API_PORT`, `CHROME_BIND_HOST`, `CHROME_MCP_TIMEOUT_MS`, `UNIFIED_MCP_PSK`, `UNIFIED_MCP_PSK_FILE`, `UNIFIED_MCP_OAUTH_ISSUER`, `UNIFIED_MCP_OAUTH_STATE_FILE`, `UNIFIED_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`, `UNIFIED_MCP_OAUTH_CF_ACCESS_TEAM_DOMAIN`, `UNIFIED_MCP_OAUTH_CF_ACCESS_AUD`, `UNIFIED_MCP_FS_CONFIG`, `UNIFIED_MCP_FS_MAX_FILE_BYTES`, `UNIFIED_MCP_FS_AUDIT_LOG`, `VIBETERM_MCP_URL`, `VIBETERM_MCP_TIMEOUT_MS`, and `VIBETERM_MCP_DISABLED`.
 
 ## Add more unified tools
 

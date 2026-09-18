@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node test/integration.mjs && node test/no-auth.mjs && node test/loopback-auth.mjs && node test/vibeterm-upstream.mjs && node test/filesystem.mjs",
+    "test": "npm run build && node test/integration.mjs && node test/no-auth.mjs && node test/loopback-auth.mjs && node test/vibeterm-upstream.mjs && node test/filesystem.mjs && node test/oauth.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"
   },
