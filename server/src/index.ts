@@ -43,7 +43,6 @@ const oauthServer = OAUTH_ISSUER ? new UnifiedMcpOAuthServer({
   issuer: OAUTH_ISSUER,
   resource: `${OAUTH_ISSUER}/mcp`,
   stateFile: OAUTH_STATE_FILE,
-  approvalSecret: process.env.UNIFIED_MCP_OAUTH_APPROVAL_SECRET || PSK,
   allowedRedirectHosts: OAUTH_ALLOWED_REDIRECT_HOSTS,
 }) : undefined;
 type BrowserConnection = { id: string; name: string; socket: WebSocket; connectedAt: string; lastSeenAt: string };
@@ -341,14 +340,12 @@ function authorize(request: IncomingMessage) {
   if (ALLOW_NO_AUTH) return;
   if (ALLOW_LOOPBACK_NO_AUTH && isDirectLoopbackRequest(request)) return;
   const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (PSK && safeEqual(supplied, PSK)) return;
-  if (oauthServer?.isAccessToken(supplied)) return;
-  if (!PSK && !oauthServer) throw new HttpError(503, "Unified MCP authentication is not configured");
-  throw new HttpError(
-    401,
-    "Unauthorized",
-    oauthServer ? { "WWW-Authenticate": oauthServer.challengeHeader } : {},
-  );
+  if (oauthServer) {
+    if (oauthServer.isAccessToken(supplied)) return;
+    throw new HttpError(401, "Unauthorized", { "WWW-Authenticate": oauthServer.challengeHeader });
+  }
+  if (!PSK) throw new HttpError(503, "Unified MCP HTTP authentication is not configured");
+  if (!safeEqual(supplied, PSK)) throw new HttpError(401, "Unauthorized");
 }
 function isDirectLoopbackRequest(request: IncomingMessage) {
   const remoteAddress = request.socket.remoteAddress || "";
