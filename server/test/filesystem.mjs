@@ -10,7 +10,6 @@ const readonly = join(temp, "readonly");
 const outside = join(temp, "outside");
 const configPath = join(temp, "filesystem-roots.json");
 const apiPort = 29766;
-const bridgePort = 29765;
 
 await mkdir(writable);
 await mkdir(readonly);
@@ -28,8 +27,7 @@ const backend = spawn(process.execPath, ["dist/index.js"], {
   cwd: new URL("..", import.meta.url),
   env: {
     ...process.env,
-    CHROME_API_PORT: String(apiPort),
-    CHROME_MCP_PORT: String(bridgePort),
+    UNIFIED_MCP_PORT: String(apiPort),
     UNIFIED_MCP_ALLOW_NO_AUTH: "true",
     UNIFIED_MCP_KEEP_ALIVE: "1",
     UNIFIED_MCP_FS_CONFIG: configPath,
