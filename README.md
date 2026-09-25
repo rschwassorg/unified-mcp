@@ -1,6 +1,6 @@
 # Unified MCP
 
-Unified MCP is a local HTTP MCP server that publishes Chrome/CDP and filesystem tools through one endpoint.
+Unified MCP is a modular local MCP server. Independent modules publish their tools through one MCP endpoint.
 
 It is intentionally local-first: the server binds to `127.0.0.1:18766` by default and direct loopback requests are accepted without an external authentication provider. There is no Cloudflare integration or GitHub Actions automation in this repository.
 
@@ -104,3 +104,34 @@ VIBETERM_MCP_DISABLED
 ```
 
 `CHROME_API_PORT` and `CHROME_BIND_HOST` remain accepted as compatibility fallbacks.
+
+
+## Module architecture
+
+First-party modules live under `server/src/modules/` and implement the small `McpModule` interface.
+
+- `system`: filesystem tools plus approved command execution.
+- `chrome-cdp`: Chrome browser and raw Chrome DevTools Protocol tools.
+
+The core server only discovers the module that owns a requested tool and dispatches the call. New capability groups can be added as modules without adding their tool routing to the core server.
+
+### Approved system commands
+
+Copy `server/commands.example.json` to the machine configuration directory as `commands.json`, or set `UNIFIED_MCP_COMMANDS_CONFIG` to another file.
+
+The system module exposes `cmd_list` and `cmd_run`. `cmd_run` only accepts command names declared in that configuration. Processes are spawned directly with `shell: false`; arbitrary shell command strings are not accepted. An optional `cwd` must be inside one of the configured filesystem roots.
+
+Example MCP call:
+
+```json
+{
+  "name": "cmd_run",
+  "arguments": {
+    "command": "git",
+    "args": ["status"],
+    "cwd": "C:\\Users\\rober\\code\\unified-mcp"
+  }
+}
+```
+
+Set `UNIFIED_MCP_COMMANDS_CONFIG` to configure a non-default command-list path.
