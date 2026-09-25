@@ -1,0 +1,8 @@
+{
+  "commands": {
+    "git": { "executable": "git", "allowedArgs": ["*"], "timeoutMs": 120000 },
+    "node": { "executable": "node", "allowedArgs": ["*"], "timeoutMs": 300000 },
+    "npm": { "executable": "npm", "allowedArgs": ["*"], "timeoutMs": 300000 },
+    "python": { "executable": "python", "allowedArgs": ["*"], "timeoutMs": 300000 }
+  }
+}
