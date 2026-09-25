@@ -1,0 +1,48 @@
+name: Deploy srv
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Build and test
+        run: |
+          npm --prefix server ci
+          npm --prefix server run build
+          npm --prefix server test
+      - name: Install on srv
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="$HOME/.local/share/unified-mcp"
+          mkdir -p "$DEST" "$HOME/.config/unified-mcp"
+          rsync -a --delete --exclude node_modules --exclude .git ./ "$DEST/"
+          cd "$DEST/server"
+          npm ci --omit=dev
+          if [ ! -f "$HOME/.config/unified-mcp/filesystem-roots.json" ]; then
+            cat > "$HOME/.config/unified-mcp/filesystem-roots.json" <<EOF
+          {"roots":{"home":{"path":"$HOME","readOnly":false}}}
+          EOF
+          fi
+          if [ ! -f "$HOME/.config/unified-mcp/commands.json" ]; then
+            cp "$DEST/server/commands.example.json" "$HOME/.config/unified-mcp/commands.json"
+          fi
+          if [ -f "$HOME/.local/share/unified-mcp.pid" ]; then
+            kill "$(cat "$HOME/.local/share/unified-mcp.pid")" 2>/dev/null || true
+            sleep 1
+          fi
+          cd "$DEST/server"
+          env -u RUNNER_TRACKING_ID             UNIFIED_MCP_BIND_HOST=0.0.0.0             UNIFIED_MCP_ALLOW_NO_AUTH=true             UNIFIED_MCP_KEEP_ALIVE=1             UNIFIED_MCP_FS_CONFIG="$HOME/.config/unified-mcp/filesystem-roots.json"             UNIFIED_MCP_COMMANDS_CONFIG="$HOME/.config/unified-mcp/commands.json"             UNIFIED_MCP_AUTHORIZED_SIGNERS="$HOME/.config/unified-mcp/authorized_signers"             nohup node dist/index.js > "$HOME/.local/share/unified-mcp.log" 2>&1 &
+          echo $! > "$HOME/.local/share/unified-mcp.pid"
+          sleep 2
+          curl --fail http://127.0.0.1:18766/health
