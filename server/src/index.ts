@@ -7,7 +7,9 @@ import { createInterface } from "node:readline";
 import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { HttpMcpUpstream } from "./mcp-upstream.js";
-import { filesystemCall, filesystemTools, ownsFilesystemTool } from "./filesystem.js";
+import type { McpModule } from "./modules/module.js";
+import { systemModule } from "./modules/system.js";
+import { createChromeCdpModule } from "./modules/chrome-cdp.js";
 
 const require = createRequire(import.meta.url);
 const SERVER_PORT = Number(process.env.UNIFIED_MCP_PORT ?? process.env.CHROME_API_PORT ?? 18766);
@@ -114,29 +116,13 @@ if (AGENT_API_HOST || AGENT_API_PORT) {
   });
 }
 
-// MCP remains available over stdio for existing clients. HTTP is an additional interface.
-const chromeMcpTools = [
-  mcpTool("chrome_browsers_list", "List connected Chrome browser clients."),
-  mcpTool("chrome_status", "Check whether the Chrome extension is connected."),
-  mcpTool("chrome_tabs_list", "List open Chrome tabs."),
-  mcpTool("chrome_tab_open", "Open Chrome tab.", { url: { type: "string" }, active: { type: "boolean", default: true } }, ["url"]),
-  mcpTool("chrome_tab_activate", "Activate and focus a Chrome tab.", { tabId: { type: "integer" } }, ["tabId"]),
-  mcpTool("chrome_tab_close", "Close a Chrome tab.", { tabId: { type: "integer" } }, ["tabId"]),
-  mcpTool("chrome_page_info", "Get page metadata.", { tabId: { type: "integer" } }),
-  mcpTool("chrome_page_text", "Get visible page text.", { tabId: { type: "integer" } }),
-  mcpTool("chrome_page_click", "Click an element by CSS selector.", { selector: { type: "string" }, tabId: { type: "integer" } }, ["selector"]),
-  mcpTool("chrome_page_type", "Type text into an input or textarea.", { selector: { type: "string" }, text: { type: "string" }, clear: { type: "boolean", default: true }, tabId: { type: "integer" } }, ["selector", "text"]),
-  mcpTool("chrome_page_script", "Run a JavaScript expression.", { script: { type: "string" }, tabId: { type: "integer" } }, ["script"]),
-  mcpTool("chrome_cdp_targets", "List CDP targets."),
-  mcpTool("chrome_cdp_protocol", "Read bundled Chrome DevTools Protocol metadata.", { domain: { type: "string" }, includeExperimental: { type: "boolean", default: true }, includeDeprecated: { type: "boolean", default: true }, includeDetails: { type: "boolean", default: false } }),
-  mcpTool("chrome_cdp_attached", "List attached CDP targets."),
-  mcpTool("chrome_cdp_attach", "Attach CDP.", { tabId: { type: "integer" }, targetId: { type: "string" }, extensionId: { type: "string" }, protocolVersion: { type: "string", default: "1.3" } }),
-  mcpTool("chrome_cdp_detach", "Detach CDP.", { tabId: { type: "integer" }, targetId: { type: "string" }, extensionId: { type: "string" } }),
-  mcpTool("chrome_cdp_send", "Send any Chrome DevTools Protocol command.", { command: { type: "string" }, params: { type: "object", default: {} }, tabId: { type: "integer" }, targetId: { type: "string" }, extensionId: { type: "string" }, protocolVersion: { type: "string", default: "1.3" }, autoAttach: { type: "boolean", default: true }, detach: { type: "boolean", default: false } }, ["command"]),
-  mcpTool("chrome_cdp_call", "Send a CDP command with auto-attach.", { command: { type: "string" }, params: { type: "object", default: {} }, tabId: { type: "integer" }, targetId: { type: "string" }, extensionId: { type: "string" }, protocolVersion: { type: "string", default: "1.3" }, detach: { type: "boolean", default: false } }, ["command"]),
-  mcpTool("chrome_cdp_events", "Poll buffered CDP events.", { limit: { type: "integer", default: 100 }, clear: { type: "boolean", default: false }, method: { type: "string" }, tabId: { type: "integer" }, targetId: { type: "string" }, extensionId: { type: "string" } })
-];
-const localMcpTools = [...chromeMcpTools, ...filesystemTools];
+// MCP modules publish independent tool groups through the unified server.
+const chromeCdpModule = createChromeCdpModule({
+  status: () => serverStatus(),
+  protocol: (args) => getCdpProtocol(args),
+  callChrome: (method, args) => chrome(method, args)
+});
+const modules: McpModule[] = [systemModule, chromeCdpModule];
 const readline = createInterface({ input: process.stdin, crlfDelay: Infinity });
 readline.on("line", (line) => { void handleMcpLine(line); });
 readline.on("close", () => { if (process.env.UNIFIED_MCP_KEEP_ALIVE !== "1") shutdown(); });
@@ -160,24 +146,17 @@ async function handleMcpRequest(request: JsonRpcRequest): Promise<unknown> {
 }
 
 async function mcpCall(name: string, args: Record<string, unknown>) {
-  const method: Record<string, string> = {
-    chrome_tabs_list: "tabs.list", chrome_tab_open: "tabs.open", chrome_tab_activate: "tabs.activate", chrome_tab_close: "tabs.close",
-    chrome_page_info: "page.info", chrome_page_text: "page.text", chrome_page_click: "page.click", chrome_page_type: "page.type", chrome_page_script: "page.script",
-    chrome_cdp_targets: "cdp.targets", chrome_cdp_attached: "cdp.attached", chrome_cdp_attach: "cdp.attach", chrome_cdp_detach: "cdp.detach", chrome_cdp_send: "cdp.send", chrome_cdp_call: "cdp.send", chrome_cdp_events: "cdp.events"
-  };
-  if (name === "chrome_status" || name === "chrome_browsers_list") return mcpText(serverStatus());
-  if (name === "chrome_cdp_protocol") return mcpText(getCdpProtocol(args));
-  if (ownsFilesystemTool(name)) return mcpText(await filesystemCall(name, args));
+  const module = modules.find((candidate) => candidate.owns(name));
+  if (module) return mcpText(await module.call(name, args));
   if (vibeTermMcp?.ownsTool(name)) return vibeTermMcp.callTool(name, args);
-  if (!method[name]) throw new Error(`Unknown tool: ${name}`);
-  const defaults = name === "chrome_page_type" ? { clear: true } : name === "chrome_cdp_attach" ? { protocolVersion: "1.3" } : name === "chrome_cdp_send" || name === "chrome_cdp_call" ? { params: {}, autoAttach: true, protocolVersion: "1.3" } : {};
-  return mcpText(await chrome(method[name], { ...defaults, ...args }));
+  throw new Error(`Unknown tool: ${name}`);
 }
 
 async function unifiedMcpTools() {
+  const moduleTools = (await Promise.all(modules.map((module) => module.tools()))).flat();
   const upstreamTools = vibeTermMcp ? await vibeTermMcp.listTools() : [];
-  const localNames = new Set(localMcpTools.map((tool) => tool.name));
-  return [...localMcpTools, ...upstreamTools.filter((tool) => !localNames.has(tool.name))];
+  const localNames = new Set(moduleTools.map((tool) => tool.name));
+  return [...moduleTools, ...upstreamTools.filter((tool) => !localNames.has(tool.name))];
 }
 
 async function handleHttp(request: IncomingMessage, response: ServerResponse) {
@@ -317,7 +296,6 @@ function numericPathId(path: string) { const value = path.match(/\/tabs\/(\d+)\/
 function queryParams(url: URL) { const entries: Record<string, unknown> = {}; for (const [key, value] of url.searchParams) entries[key] = key === "tabId" || key === "limit" ? Number(value) : key === "clear" ? stringBoolean(value, false) : value; return entries; }
 function stringBoolean(value: unknown, fallback: boolean) { return value === undefined ? fallback : value === true || value === "true"; }
 function asObject(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
-function mcpTool(name: string, description: string, properties: Record<string, unknown> = {}, required: string[] = []) { return { name, title: name, description, inputSchema: { type: "object", title: `${name}_input`, properties: { browserId: { type: "string", description: "Connected browser ID. Required when more than one browser is online." }, ...properties }, required } }; }
 function mcpText(value: unknown) { return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] }; }
 function respondMcp(id: string | number, result: unknown) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`); }
 function respondMcpError(id: string | number, message: string) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`); }
