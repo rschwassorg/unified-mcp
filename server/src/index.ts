@@ -8,7 +8,8 @@ import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { HttpMcpUpstream } from "./mcp-upstream.js";
 import type { McpModule } from "./modules/module.js";
-import { systemModule } from "./modules/system.js";
+import { createSystemModule } from "./modules/system.js";
+import { systemWss, listSystems, callSystem, shutdownSystems } from "./system-registry.js";
 import { createChromeCdpModule } from "./modules/chrome-cdp.js";
 
 const require = createRequire(import.meta.url);
@@ -117,6 +118,7 @@ if (AGENT_API_HOST || AGENT_API_PORT) {
 }
 
 // MCP modules publish independent tool groups through the unified server.
+const systemModule = createSystemModule({ listSystems, callSystem });
 const chromeCdpModule = createChromeCdpModule({
   status: () => serverStatus(),
   protocol: (args) => getCdpProtocol(args),
@@ -190,11 +192,13 @@ async function handleHttp(request: IncomingMessage, response: ServerResponse) {
 async function handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer) {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
+    if (url.pathname === "/bridge/system") {
+      systemWss.handleUpgrade(request, socket, head, (websocket) => systemWss.emit("connection", websocket, request));
+      return;
+    }
     if (url.pathname !== "/bridge") throw new HttpError(404, "WebSocket bridge not found");
     await authorize(request);
-    wss.handleUpgrade(request, socket, head, (websocket) => {
-      wss.emit("connection", websocket, request);
-    });
+    wss.handleUpgrade(request, socket, head, (websocket) => wss.emit("connection", websocket, request));
   } catch (error) {
     const status = error instanceof HttpError ? error.status : 500;
     const reason = status === 401 ? "Unauthorized" : status === 403 ? "Forbidden" : status === 404 ? "Not Found" : "Internal Server Error";
@@ -348,7 +352,7 @@ function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   for (const waiter of pending.values()) { clearTimeout(waiter.timeout); waiter.reject(new Error("Chrome API is shutting down.")); }
-  pending.clear(); for (const browser of browsers.values()) browser.socket.close(); browsers.clear(); api.close(); wss.close();
+  pending.clear(); for (const browser of browsers.values()) browser.socket.close(); browsers.clear(); shutdownSystems(); api.close(); wss.close();
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
