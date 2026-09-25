@@ -8,7 +8,6 @@ import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { HttpMcpUpstream } from "./mcp-upstream.js";
 import { filesystemCall, filesystemTools, ownsFilesystemTool } from "./filesystem.js";
-import { CloudflareAccessError, CloudflareAccessValidator } from "./cloudflare-access.js";
 
 const require = createRequire(import.meta.url);
 const SERVER_PORT = Number(process.env.UNIFIED_MCP_PORT ?? process.env.CHROME_API_PORT ?? 18766);
@@ -19,9 +18,6 @@ const REQUEST_TIMEOUT_MS = Number(process.env.CHROME_MCP_TIMEOUT_MS ?? 15000);
 const DEBUG_LOG = process.env.CHROME_MCP_DEBUG_LOG || join(process.cwd(), "chrome-mcp-debug.log");
 const PUBLIC_DIR = join(process.cwd(), "public");
 const VIBETERM_MCP_URL = process.env.VIBETERM_MCP_URL ?? "http://127.0.0.1:47821/mcp";
-const CF_ACCESS_TEAM_DOMAIN = process.env.UNIFIED_MCP_CF_ACCESS_TEAM_DOMAIN || "";
-const CF_ACCESS_AUD = process.env.UNIFIED_MCP_CF_ACCESS_AUD || "";
-const CF_ACCESS_CERTS_URL = process.env.UNIFIED_MCP_CF_ACCESS_CERTS_URL || "";
 
 type ChromeRequest = { type: "request"; id: string; method: string; params?: Record<string, unknown> };
 type ChromeResponse = { type: "response"; id: string; ok: boolean; result?: unknown; error?: string };
@@ -35,12 +31,6 @@ const jsProtocol = require("devtools-protocol/json/js_protocol.json") as Protoco
 const cdpProtocol: ProtocolDefinition = { version: browserProtocol.version, domains: [...browserProtocol.domains, ...jsProtocol.domains] };
 
 const ALLOW_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_NO_AUTH === "true";
-const ALLOW_LOOPBACK_NO_AUTH = process.env.UNIFIED_MCP_ALLOW_LOOPBACK_NO_AUTH === "true";
-const cloudflareAccess = CF_ACCESS_TEAM_DOMAIN && CF_ACCESS_AUD ? new CloudflareAccessValidator({
-  teamDomain: CF_ACCESS_TEAM_DOMAIN,
-  audience: CF_ACCESS_AUD,
-  certsUrl: CF_ACCESS_CERTS_URL || undefined,
-}) : undefined;
 type BrowserConnection = { id: string; name: string; socket: WebSocket; connectedAt: string; lastSeenAt: string };
 const pending = new Map<string, { browserId: string; resolve: (value: unknown) => void; reject: (reason: Error) => void; timeout: NodeJS.Timeout }>();
 const browsers = new Map<string, BrowserConnection>();
@@ -331,7 +321,7 @@ function mcpTool(name: string, description: string, properties: Record<string, u
 function mcpText(value: unknown) { return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] }; }
 function respondMcp(id: string | number, result: unknown) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`); }
 function respondMcpError(id: string | number, message: string) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`); }
-function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], port: SERVER_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : cloudflareAccess ? "cloudflare-access" : ALLOW_LOOPBACK_NO_AUTH ? "loopback-only" : "unconfigured", cloudflareAccessTeam: cloudflareAccess?.teamDomain }; }
+function serverStatus() { return { connected: browsers.size > 0, browsers: Array.from(browsers.values(), ({ id, name, connectedAt, lastSeenAt }) => ({ id, name, connectedAt, lastSeenAt })), upstreams: vibeTermMcp ? [vibeTermMcp.status()] : [], port: SERVER_PORT, pendingRequests: pending.size, authentication: ALLOW_NO_AUTH ? "disabled" : "loopback-only" }; }
 function registerBrowser(socket: WebSocket, id: string, name: string) {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(id)) return socket.close(1008, "Invalid browserId");
   const previous = browsers.get(id);
@@ -349,15 +339,8 @@ function selectBrowser(value: unknown) {
   return browser;
 }
 async function authorize(request: IncomingMessage) {
-  if (ALLOW_NO_AUTH) return;
-  if (ALLOW_LOOPBACK_NO_AUTH && isDirectLoopbackRequest(request)) return;
-  if (!cloudflareAccess) throw new HttpError(503, "Cloudflare Access authentication is not configured");
-  try {
-    await cloudflareAccess.authenticate(request);
-  } catch (error) {
-    if (error instanceof CloudflareAccessError) throw new HttpError(error.status, error.message);
-    throw error;
-  }
+  if (ALLOW_NO_AUTH || isDirectLoopbackRequest(request)) return;
+  throw new HttpError(403, "Remote access is disabled. Bind to loopback or explicitly set UNIFIED_MCP_ALLOW_NO_AUTH=true.");
 }
 function isDirectLoopbackRequest(request: IncomingMessage) {
   const remoteAddress = request.socket.remoteAddress || "";

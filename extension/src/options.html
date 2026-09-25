@@ -15,31 +15,17 @@
 </head>
 <body>
   <h1>Chrome MCP connection</h1>
-  <p class="note">
-    Public connections are authenticated by Cloudflare Access. The extension no longer stores or sends a PSK.
-    Sign in once through the protected Unified MCP hostname so Cloudflare can set its authorization cookie,
-    then connect over WSS.
-  </p>
+  <p class="note">By default Unified MCP listens on loopback only. Point the extension at the local WebSocket bridge.</p>
   <form id="settings">
     <label for="serverUrl">Bridge WebSocket URL</label>
-    <input id="serverUrl" required placeholder="wss://unified-mcp.pentestsystem.com/bridge">
-
+    <input id="serverUrl" required placeholder="ws://127.0.0.1:18766/bridge">
     <label for="browserId">Browser ID</label>
     <input id="browserId" required pattern="[A-Za-z0-9._-]{1,128}">
-
     <label for="browserName">Browser name</label>
     <input id="browserName" required>
-
-    <button type="button" id="cloudflareLogin">Sign in with Cloudflare Access</button>
     <button type="submit">Save and reconnect</button>
     <span id="saved"></span>
   </form>
-
-  <p class="note">
-    For cross-origin extension WebSockets, keep the Cloudflare Access application cookie SameSite setting at None.
-    Cloudflare terminates WSS; the local Unified MCP service itself listens only on HTTP.
-  </p>
-
   <script src="options.js" type="module"></script>
 </body>
 </html>

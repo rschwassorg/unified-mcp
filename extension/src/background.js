@@ -1,5 +1,5 @@
-const DEFAULT_SERVER_URL = "wss://unified-mcp.pentestsystem.com/bridge";
-const LEGACY_SERVER_URLS = new Set(["wss://localhost:9443/bridge", "ws://127.0.0.1:18767"]);
+const DEFAULT_SERVER_URL = "ws://127.0.0.1:18766/bridge";
+const LEGACY_SERVER_URLS = new Set(["wss://unified-mcp.pentestsystem.com/bridge", "wss://localhost:9443/bridge", "ws://127.0.0.1:18767"]);
 const RECONNECT_ALARM = "chrome-mcp-reconnect";
 const HEARTBEAT_MS = 20000;
 const RECONNECT_MS = 15000;
